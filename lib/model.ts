@@ -1,4 +1,4 @@
-// The token radar's model (radar-5): one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model (radar-6): one snapshot of the protocol universe in, one ranked board out.
 //
 // A protocol is pre-token when its index entry records no token (no market cap, no CoinGecko id, no
 // symbol). Implied value is calibrated on the snapshot's own token-bearing protocols (the peers):
@@ -29,7 +29,17 @@
 //
 // A category with fewer than 3 peers blends in its family's multiple (weight (3 - n) / 3).
 //
+// radar-6 adds proof and presentation only; the point estimates of radar-5 are unchanged. A validation ladder
+// (naive / category-only / full, under 5-fold, repeated 10-fold, leave-one-out and walk-forward, plus
+// leave-one-category-out, a per-term ablation and an 80% band) refits the multiples, the shrinkage and the Huber
+// fit inside every training part. The 20 pre-token protocols radar-5 set aside are audited one by one: those with
+// a TVL at the floor and a chain are valued by the same pipeline, tagged low confidence and shown with the 80%
+// band; the rest are quarantined with a reason. An integrity array of computed checks ships with the data.
+//
 // No protocol name is ever special-cased: the same function scores every row.
+
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -88,7 +98,7 @@ export const MODEL: ModelConstants = {
   chain_cap: 7,
 };
 
-export const MODEL_VERSION = 'radar-5';
+export const MODEL_VERSION = 'radar-6';
 
 /** radar-5 fixed choices: the dashboard states them. */
 export const FIT = {
@@ -102,9 +112,14 @@ export const FIT = {
   huber_iters: 25,
   huber_k: 1.345,
   cv_folds: 5,
+  cv10_folds: 10,
+  cv10_repeats: 3,
+  loco_min_peers: 4,
   walk_train_share: 0.6,
   band_lo: 0.25,
   band_hi: 0.75,
+  band80_lo: 0.1,
+  band80_hi: 0.9,
   logit_iters: 50,
   logit_lambda: 1,
   logit_ridge: 1e-9,
@@ -197,6 +212,14 @@ export interface PlanFigures {
   /** Point EV over all-in cost, and P25 EV over all-in cost. */
   ev_ratio: number;
   ev_p25_ratio: number;
+  /** Circulating launch value at which point EV a wallet equals the all-in cost: all-in x wallets / (pool share x odds). */
+  break_even_value_usd: number;
+  /** Point EV and P25 EV less the all-in cost, and the P25 net as a percent of the all-in cost. */
+  net_point_usd: number;
+  net_p25_usd: number;
+  net_p25_roi_pct: number;
+  /** Point EV net of the all-in cost at other deposits: [deposit, net]; only the opportunity term changes. */
+  deposit_net: [number, number][];
 }
 
 /** One tokenized peer of the same category, nearest in TVL. */
@@ -230,9 +253,21 @@ export interface RadarRow {
   farm_cost_usd: number;
   farm_hours: number;
   farm_verdict: string;
-  /** Peers' P25..P75 of the out-of-fold residual, applied to the implied value. */
+  /** The displayed range: the peers' P25..P75 of the out-of-fold residual applied to the implied value (range_level 50), or P10..P90 for a low-confidence row (range_level 80). */
   value_low: number;
   value_high: number;
+  range_level: 50 | 80;
+  /** The P25 value the verdict's P25 EV uses (equal to value_low on a 50% row). */
+  value_p25: number;
+  /** Ranks the displayed range would take in the board's point-value ordering: rank_low is the best (smallest) number, from value_high; rank_high the worst, from value_low. */
+  rank_low: number;
+  rank_high: number;
+  /** 'low' for a protocol promoted from the set-aside list, 'normal' otherwise. */
+  confidence: 'normal' | 'low';
+  /** True for a row promoted from the set-aside list. */
+  promoted: boolean;
+  /** Promoted rows only: how the peer multiple was reached, in words. */
+  why?: string;
   /** The shrunk tokenized share of the row's category, the logistic's first feature. */
   cat_share: number;
   /** Combined-adjustment clamp factor, 1 unless the [0.5, 2] clamp binds. */
@@ -283,6 +318,9 @@ export interface RadarData {
   peers: PeerRow[];
   fit: FitReport;
   coverage: Coverage;
+  quarantined: Quarantined[];
+  integrity: IntegrityCheck[];
+  promoted_size: number;
   odds: OddsReport;
   farm: FarmAssumptions;
   /** Reconciliation: the board's row count, its implied total and an FNV-1a hash of slug+implied in rank order. */
@@ -343,18 +381,72 @@ export interface FitReport {
   walk: ErrorPair & { n_fit: number; from: string; to: string; undated: number };
   /** Empirical quantiles of the out-of-fold residual ln(actual / predicted), and the walk-forward coverage of the band they make. */
   band: { q25: number; q75: number; coverage: number; inside: number; n: number };
+  /** The 80% band: empirical P10/P90 of the same out-of-fold residual, with its walk-forward coverage measured the same way. */
+  band80: { q10: number; q90: number; coverage: number; inside: number; n: number };
+  /** The validation ladder: three variants under four schemes, leave-one-category-out, and the per-term ablation. */
+  ladder: Ladder;
   /** Out-of-fold [log10 predicted, log10 actual] for every peer. */
   scatter: [number, number][];
+}
+
+/** One ladder row: median abs log error of a variant under each scheme, and its ratios to naive and to category-only. */
+export interface LadderRow {
+  id: 'naive' | 'category' | 'full';
+  label: string;
+  /** [5-fold, repeated 10-fold, leave-one-out, walk-forward] */
+  errors: number[];
+  vs_naive: number[];
+  vs_category: number[];
+}
+
+/** The validation ladder, every number computed with leakage-free refits. */
+export interface Ladder {
+  schemes: string[];
+  /** Predictions behind each scheme's median. */
+  n: number[];
+  rows: LadderRow[];
+  repeats: number;
+  folds10: number;
+  loco: { categories: number; n: number; naive: number; category_only: number; full: number; by_category: { category: string; n: number; naive: number; category_only: number; full: number }[] };
+  ablation: { full: number; terms: { term: string; error: number; delta: number }[] };
+  summary: string;
+  /** One honest line on constants chosen with the full peer set in view. */
+  note: string;
+}
+
+/** One computed check of the build. `pass` is null for a line that reports without judging. */
+export interface IntegrityCheck {
+  id: string;
+  label: string;
+  value: string;
+  /** The chip's compact text. */
+  short: string;
+  pass: boolean | null;
+  kind: 'check' | 'info' | 'limit';
+}
+
+/** A set-aside protocol the board does not rank, and why. */
+export interface Quarantined {
+  slug: string;
+  name: string;
+  category: string | null;
+  tvl_usd: number;
+  chains: string[];
+  reason: string;
 }
 
 /** Every protocol in the snapshot has exactly one disposition; the buckets sum to total. */
 export interface Coverage {
   total: number;
   tokenized: number;
+  /** On the board, promoted rows included. */
   ranked: number;
+  /** Of the ranked, the rows promoted from the set-aside list (low confidence). */
+  promoted: number;
   excluded: number;
   excluded_reasons: Record<string, number>;
-  other_pre_token: number;
+  /** Set aside and not priced (see RadarData.quarantined). */
+  quarantined: number;
   floor_usd: number;
   as_of: string;
 }
@@ -561,15 +653,20 @@ export function huber(X: number[][], y: number[]): number[] | null {
 }
 
 /** Fit the adjustments on a set of peers, with comps built from those same peers. A degenerate fit is the radar-2 fallback. */
-function fitPeers(peers: SnapshotProtocol[], asOf: string, comps: Comparables, model: ModelConstants): Fitted {
+function fitPeers(peers: SnapshotProtocol[], asOf: string, comps: Comparables, model: ModelConstants, drop = -1): Fitted {
   const fallback: Fitted = { coef: [], means: [], fallback: true };
   if (peers.length < FIT.min_fit_peers) return fallback;
   const F = peers.map((p) => featuresOf(p, asOf, comps, model));
   const means = [0, 1, 2, 3].map((j) => F.reduce((s, f) => s + f[j]!, 0) / F.length);
   const y = peers.map((p) => Math.log(p.mcap_usd! / (p.tvl_usd * categoryMultiple(p.category, comps, model).pm)));
-  const beta = huber(F.map((f) => [1, ...f.map((v, j) => v - means[j]!)]), y);
+  // `drop` (ablation only) leaves one term out of the regression; its coefficient is then 0, so its factor is exactly 1.
+  const kept = [0, 1, 2, 3].filter((j) => j !== drop);
+  const beta = huber(F.map((f) => [1, ...kept.map((j) => f[j]! - means[j]!)]), y);
   if (beta === null || y.some((v) => !Number.isFinite(v))) return fallback;
-  return { coef: beta, means, fallback: false };
+  if (drop < 0) return { coef: beta, means, fallback: false };
+  const coef = [beta[0]!, 0, 0, 0, 0];
+  kept.forEach((j, i) => { coef[j + 1] = beta[i + 1]!; });
+  return { coef, means, fallback: false };
 }
 
 /** The five adjustment factors (base, size, growth, maturity, chain), each clamped to [0.5, 2], and the clamp that keeps their product in [0.5, 2]. */
@@ -626,41 +723,109 @@ const charSum = (t: string): number => {
 /** One out-of-sample prediction: the actual mcap, the category multiple alone and the full fitted model. */
 interface Pred {
   p: SnapshotProtocol;
+  /** The naive variant: TVL x the global median multiple, no category, no adjustments. */
+  naiveV: number;
   baseV: number;
   fittedV: number;
 }
 
 /** Refit the multiples and the Huber fit on `train` alone, then predict every `test` peer. */
-function predictOut(train: SnapshotProtocol[], test: SnapshotProtocol[], snapshot: Snapshot, model: ModelConstants): Pred[] {
+function predictOut(train: SnapshotProtocol[], test: SnapshotProtocol[], snapshot: Snapshot, model: ModelConstants, drop = -1): Pred[] {
   const comps = baseComparables(train, snapshot.protocols);
-  comps.fit = fitPeers(train, snapshot.as_of, comps, model);
+  comps.fit = fitPeers(train, snapshot.as_of, comps, model, drop);
   return test.map((p) => {
     const baseV = p.tvl_usd * categoryMultiple(p.category, comps, model).pm;
-    return { p, baseV, fittedV: baseV * adjustments(p, snapshot.as_of, comps, model).total };
+    return { p, naiveV: p.tvl_usd * comps.globalMedian, baseV, fittedV: baseV * adjustments(p, snapshot.as_of, comps, model).total };
   });
+}
+
+/** Out-of-fold predictions: each fold is predicted by a model refit on the other folds. */
+function kfold(peers: SnapshotProtocol[], foldOf: (p: SnapshotProtocol) => number, k: number, snapshot: Snapshot, model: ModelConstants, drop = -1): Pred[] {
+  const out: Pred[] = [];
+  for (let f = 0; f < k; f++) {
+    const train = peers.filter((p) => foldOf(p) !== f);
+    const test = peers.filter((p) => foldOf(p) === f);
+    if (train.length > 0 && test.length > 0) out.push(...predictOut(train, test, snapshot, model, drop));
+  }
+  return out;
 }
 
 const absLogErr = (xs: Pred[], f: (x: Pred) => number): number => median(xs.map((x) => Math.abs(Math.log(x.p.mcap_usd! / f(x)))));
 
+const NAIVE = (x: Pred): number => x.naiveV;
+const CATEGORY = (x: Pred): number => x.baseV;
+const FULL = (x: Pred): number => x.fittedV;
+const ABLATED_TERMS = ['ln TVL', '7d change', 'ln age', 'ln chains'];
+
+/** The validation ladder: every scheme refits the multiples, the shrinkage and the Huber fit on its own training part. */
+function buildLadder(peers: SnapshotProtocol[], oof5: Pred[], wf: Pred[], fold5: (p: SnapshotProtocol) => number, snapshot: Snapshot, model: ModelConstants): Ladder {
+  // Repeated 10-fold: each repeat orders the peers by a hash of "repeat|slug" and deals them into folds, so the folds are balanced and repeatable.
+  const rep10: Pred[] = [];
+  for (let r = 0; r < FIT.cv10_repeats; r++) {
+    const key = new Map(peers.map((p) => [p.slug, fnv1a(`${r}|${p.slug}`)]));
+    const order = [...peers].sort((a, b) => cmp(key.get(a.slug)!, key.get(b.slug)!) || cmp(a.slug, b.slug));
+    const fold = new Map(order.map((p, i) => [p.slug, i % FIT.cv10_folds]));
+    rep10.push(...kfold(peers, (p) => fold.get(p.slug)!, FIT.cv10_folds, snapshot, model));
+  }
+  const loo: Pred[] = peers.flatMap((p) => predictOut(peers.filter((q) => q !== p), [p], snapshot, model));
+
+  // Leave one category out: the full model on a category it never saw (categories with enough peers only).
+  const byCat = new Map<string, SnapshotProtocol[]>();
+  for (const p of peers) (byCat.get(catKey(p.category)) ?? byCat.set(catKey(p.category), []).get(catKey(p.category))!).push(p);
+  const locoAll: Pred[] = [];
+  const by_category = [...byCat].filter(([, v]) => v.length >= FIT.loco_min_peers).sort(([a], [b]) => cmp(a, b)).map(([category, test]) => {
+    const preds = predictOut(peers.filter((p) => catKey(p.category) !== category), test, snapshot, model);
+    locoAll.push(...preds);
+    return { category, n: test.length, naive: round4(absLogErr(preds, NAIVE)), category_only: round4(absLogErr(preds, CATEGORY)), full: round4(absLogErr(preds, FULL)) };
+  });
+
+  // Per-term ablation under the 5-fold scheme: drop one Huber term, refit inside every fold, compare with the full model.
+  const fullErr = absLogErr(oof5, FULL);
+  const terms = ABLATED_TERMS.map((term, j) => {
+    const error = absLogErr(kfold(peers, fold5, FIT.cv_folds, snapshot, model, j), FULL);
+    return { term, error: round4(error), delta: round4(error - fullErr) };
+  });
+
+  const sets = [oof5, rep10, loo, wf];
+  const err = (f: (x: Pred) => number): number[] => sets.map((s) => absLogErr(s, f));
+  const e = { naive: err(NAIVE), category: err(CATEGORY), full: err(FULL) };
+  const ratio = (a: number[], b: number[]): number[] => a.map((v, i) => round4(v / b[i]!));
+  const mk = (id: LadderRow['id'], label: string): LadderRow => ({ id, label, errors: e[id].map(round4), vs_naive: ratio(e[id], e.naive), vs_category: ratio(e[id], e.category) });
+  const rows = [mk('naive', 'Naive (global median)'), mk('category', 'Category-only (shrunk)'), mk('full', 'Full model (+ Huber)')];
+  const f2 = (v: number): string => v.toFixed(2);
+  const summary = `median abs log error, full / category-only / naive: ${['5-fold', `${FIT.cv10_folds}-fold x${FIT.cv10_repeats}`, 'LOO', 'walk-forward'].map((n, i) => `${n} ${f2(e.full[i]!)}/${f2(e.category[i]!)}/${f2(e.naive[i]!)}`).join(', ')}`;
+  return {
+    schemes: ['5-fold', `${FIT.cv10_folds}-fold x${FIT.cv10_repeats}`, 'Leave-one-out', 'Walk-forward'],
+    n: sets.map((x) => x.length),
+    rows,
+    repeats: FIT.cv10_repeats,
+    folds10: FIT.cv10_folds,
+    loco: { categories: by_category.length, n: locoAll.length, naive: round4(absLogErr(locoAll, NAIVE)), category_only: round4(absLogErr(locoAll, CATEGORY)), full: round4(absLogErr(locoAll, FULL)), by_category },
+    ablation: { full: round4(fullErr), terms },
+    summary,
+    note: `Not tuned inside the folds: the shrinkage weight ${MODEL.prior_weight}, the p90 cap level, the thin-category threshold ${FIT.thin_peers}, the Huber delta ${FIT.huber_k} and the 60/40 walk-forward split were set during development with the full peer set in view, so every error here is mildly optimistic.`,
+  };
+}
+
 /** Validation: 5-fold CV and walk-forward, errors fitted vs category-only, the P25/P75 band and its walk-forward coverage. */
 export function validate(snapshot: Snapshot, model: ModelConstants = MODEL): FitReport {
   const peers = snapshot.protocols.filter(isPeer).sort((a, b) => cmp(a.slug, b.slug));
-  const oof: Pred[] = [];
-  for (let f = 0; f < FIT.cv_folds; f++) {
-    const train = peers.filter((p) => charSum(p.slug) % FIT.cv_folds !== f);
-    const test = peers.filter((p) => charSum(p.slug) % FIT.cv_folds === f);
-    if (train.length > 0 && test.length > 0) oof.push(...predictOut(train, test, snapshot, model));
-  }
+  const fold5 = (p: SnapshotProtocol): number => charSum(p.slug) % FIT.cv_folds;
+  const oof = kfold(peers, fold5, FIT.cv_folds, snapshot, model);
   oof.sort((a, b) => cmp(a.p.slug, b.p.slug));
   const resid = oof.map((x) => Math.log(x.p.mcap_usd! / x.fittedV));
   const q25 = Math.min(0, quantile(resid, FIT.band_lo));
   const q75 = Math.max(0, quantile(resid, FIT.band_hi));
+  const q10 = Math.min(0, quantile(resid, FIT.band80_lo));
+  const q90 = Math.max(0, quantile(resid, FIT.band80_hi));
 
   const dated = [...peers].sort((a, b) => cmp(a.listed_at ?? '', b.listed_at ?? '') || cmp(a.slug, b.slug));
   const nFit = Math.round(dated.length * FIT.walk_train_share);
   const wf = predictOut(dated.slice(0, nFit), dated.slice(nFit), snapshot, model);
   const inside = wf.filter((x) => x.p.mcap_usd! >= x.fittedV * Math.exp(q25) && x.p.mcap_usd! <= x.fittedV * Math.exp(q75)).length;
+  const inside80 = wf.filter((x) => x.p.mcap_usd! >= x.fittedV * Math.exp(q10) && x.p.mcap_usd! <= x.fittedV * Math.exp(q90)).length;
   const datedOnly = dated.filter((p) => p.listed_at !== null);
+  const ladder = buildLadder(peers, oof, wf, fold5, snapshot, model);
 
   const all = comparables(snapshot, model);
   const log10 = (v: number): number => Math.round((Math.log(v) / Math.LN10) * 1000) / 1000;
@@ -684,6 +849,8 @@ export function validate(snapshot: Snapshot, model: ModelConstants = MODEL): Fit
       undated: dated.length - datedOnly.length,
     },
     band: { q25: round4(q25), q75: round4(q75), coverage: round4(wf.length === 0 ? 0 : inside / wf.length), inside, n: wf.length },
+    band80: { q10: round4(q10), q90: round4(q90), coverage: round4(wf.length === 0 ? 0 : inside80 / wf.length), inside: inside80, n: wf.length },
+    ladder,
     scatter: oof.map((x) => [log10(x.fittedV), log10(x.p.mcap_usd!)]),
   };
 }
@@ -872,6 +1039,9 @@ export function depositFor(tvl: number): number {
   return clampTo(Math.round((Math.max(tvl, 0) * DEPOSIT.rate) / DEPOSIT.step) * DEPOSIT.step, DEPOSIT.min, DEPOSIT.max);
 }
 
+/** Deposits the detail pane's sensitivity table shows. */
+export const DEPOSIT_SENSITIVITY = [2500, 10000, 50000];
+const wholeUsd = (n: number): string => `$${Math.round(n).toLocaleString('en-US')}`;
 const usd = (n: number): string => (n >= 10 ? `$${Math.round(n).toLocaleString('en-US')}` : `$${n.toFixed(2)}`);
 
 /**
@@ -880,8 +1050,8 @@ const usd = (n: number): string => (n >= 10 ? `$${Math.round(n).toLocaleString('
  * Worth it: point EV >= 3x all-in AND P25 EV >= 1x all-in. Marginal: point EV >= 1x all-in but not Worth it. Skip: point EV < 1x all-in.
  */
 export function farmVerdict(
-  steps: FarmStep[], ev: number, riskAdjusted: number, participants: number, deposit: number, holdDays: number | null, evP25: number,
-): { cost: number; hours: number; verdict: string; hold_weeks: number; opportunity: number; all_in: number; ratio: number; ratio_p25: number } {
+  steps: FarmStep[], ev: number, riskAdjusted: number, participants: number, deposit: number, holdDays: number | null, evP25: number, odds: number,
+): { cost: number; hours: number; verdict: string; hold_weeks: number; opportunity: number; all_in: number; ratio: number; ratio_p25: number; break_even: number; deposit_net: [number, number][] } {
   const cost = Math.round(steps.reduce((s, x) => s + x.cost_usd, 0) * 100) / 100;
   const hours = Math.round(steps.reduce((s, x) => s + x.hours, 0) * 100) / 100;
   const holdWeeks = holdDays === null ? FIT.hold_weeks_fallback : holdDays / 7;
@@ -889,9 +1059,14 @@ export function farmVerdict(
   const allIn = cost + hours * FIT.hour_value_usd + opportunity;
   const ratio = ev / allIn;
   const ratioP25 = evP25 / allIn;
+  // Break-even: the launch value at which point EV a wallet (value x odds x pool share / wallets) equals the all-in cost.
+  const breakEven = (allIn * participants) / (FIT.airdrop_pool_share * odds);
+  // Deposit sensitivity: proceeds are an equal per-wallet split, so only the opportunity term moves with the deposit.
+  const fixed = cost + hours * FIT.hour_value_usd;
+  const depositNet = DEPOSIT_SENSITIVITY.map((d): [number, number] => [d, Math.round((ev - (fixed + d * FIT.capital_apr * (holdWeeks / 52))) * 100) / 100]);
   const label = ratio >= FIT.worth_ratio && ratioP25 >= FIT.worth_p25_floor ? 'Worth it' : ratio >= FIT.marginal_ratio ? 'Marginal' : 'Skip';
-  const verdict = `${label}: point EV ${usd(ev)} a wallet (risk-adjusted ${usd(riskAdjusted)} x ${FIT.airdrop_pool_share * 100}% pool / ${participants.toLocaleString('en-US')} wallets), P25 EV ${usd(evP25)}, vs all-in ${usd(allIn)} (${usd(cost)} fees + ${hours.toFixed(1)}h x $${FIT.hour_value_usd} + ${usd(opportunity)} opportunity on $${deposit.toLocaleString('en-US')} for ${holdWeeks.toFixed(1)} weeks at ${(FIT.capital_apr * 100).toFixed(1)}%): EV/cost ${ratio.toFixed(2)}x point, ${ratioP25.toFixed(2)}x P25.`;
-  return { cost, hours, verdict, hold_weeks: holdWeeks, opportunity, all_in: allIn, ratio, ratio_p25: ratioP25 };
+  const verdict = `${label}: point EV ${usd(ev)} a wallet (risk-adjusted ${usd(riskAdjusted)} x ${FIT.airdrop_pool_share * 100}% pool / ${participants.toLocaleString('en-US')} wallets), P25 EV ${usd(evP25)}, vs all-in ${usd(allIn)} (${usd(cost)} fees + ${hours.toFixed(1)}h x $${FIT.hour_value_usd} + ${usd(opportunity)} opportunity on $${deposit.toLocaleString('en-US')} for ${holdWeeks.toFixed(1)} weeks at ${(FIT.capital_apr * 100).toFixed(1)}%): EV/cost ${ratio.toFixed(2)}x point, ${ratioP25.toFixed(2)}x P25. Break-even launch value ${wholeUsd(breakEven)} (point EV equals all-in cost).`;
+  return { cost, hours, verdict, hold_weeks: holdWeeks, opportunity, all_in: allIn, ratio, ratio_p25: ratioP25, break_even: breakEven, deposit_net: depositNet };
 }
 
 /** FNV-1a (32-bit) of a string's UTF-8 bytes, as 8 hex digits. */
@@ -902,7 +1077,7 @@ export function fnv1a(text: string): string {
 }
 
 /** What the dashboard shows beside a board row and the board itself does not carry. */
-export type RowExtras = Pick<RadarRow, 'value_low' | 'value_high' | 'cat_share' | 'clamp_adj' | 'waterfall' | 'nearest' | 'plan'>;
+export type RowExtras = Pick<RadarRow, 'value_low' | 'value_high' | 'range_level' | 'value_p25' | 'rank_low' | 'rank_high' | 'confidence' | 'promoted' | 'why' | 'cat_share' | 'clamp_adj' | 'waterfall' | 'nearest' | 'plan'>;
 
 /**
  * Up to 3 tokenized peers of the same category, nearest in TVL (|ln of the ratio|), ties by slug. When fewer than 3
@@ -921,7 +1096,7 @@ export function nearestPeers(p: SnapshotProtocol, peers: SnapshotProtocol[]): Ne
 }
 
 /** The board and, per slug, the extras only the dashboard shows. `validation` and `prop` are the fits to score with. */
-function scoreBoard(snapshot: Snapshot, model: ModelConstants, validation: FitReport, prop: Propensity): { board: BoardRow[]; extras: Map<string, RowExtras> } {
+function scoreBoard(snapshot: Snapshot, model: ModelConstants, validation: FitReport, prop: Propensity): { board: BoardRow[]; extras: Map<string, RowExtras>; quarantined: Quarantined[] } {
   const comps = comparables(snapshot, model);
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const watch = new Set(snapshot.watchlist);
@@ -939,6 +1114,17 @@ function scoreBoard(snapshot: Snapshot, model: ModelConstants, validation: FitRe
     .slice(0, EARLY_ROWS);
   for (const e of early) chosen.set(e.p.slug, e.p);
 
+  // The set-aside audit: a rankable pre-token protocol the board has not taken is judged on its own record. It is promoted
+  // (priced by the same pipeline, low confidence) with a TVL at the floor and at least one chain, and quarantined otherwise.
+  const promoted = new Set<string>();
+  const quarantined: Quarantined[] = [];
+  for (const p of snapshot.protocols) {
+    if (chosen.has(p.slug) || !isRankable(p)) continue;
+    const reason = quarantineReason(p, snapshot.floor_usd);
+    if (reason === null) { chosen.set(p.slug, p); promoted.add(p.slug); } else quarantined.push({ slug: p.slug, name: p.name, category: p.category, tvl_usd: p.tvl_usd, chains: p.chains, reason });
+  }
+  quarantined.sort((a, b) => cmp(a.slug, b.slug));
+
   const scored = [...chosen.values()].map(score);
   scored.sort((a, b) => b.implied - a.implied || cmp(a.p.slug, b.p.slug));
   const extras = new Map<string, RowExtras>();
@@ -951,7 +1137,13 @@ function scoreBoard(snapshot: Snapshot, model: ModelConstants, validation: FitRe
     const ev = (s.implied * launch * FIT.airdrop_pool_share) / plan.participants;
     const valueLow = Math.max(1, Math.min(s.implied, Math.round(s.implied * Math.exp(validation.band.q25))));
     const evP25 = (valueLow * launch * FIT.airdrop_pool_share) / plan.participants;
-    const fv = farmVerdict(plan.steps, ev, risk, plan.participants, plan.deposit, plan.hold_days, evP25);
+    const fv = farmVerdict(plan.steps, ev, risk, plan.participants, plan.deposit, plan.hold_days, evP25, launch);
+    // Range shown: the 50% band, or the wider 80% band for a low-confidence (promoted) row. The verdict keeps using the P25 value.
+    const lowConf = promoted.has(s.p.slug);
+    const shownLow = lowConf ? Math.max(1, Math.min(s.implied, Math.round(s.implied * Math.exp(validation.band80.q10)))) : valueLow;
+    const shownHigh = Math.max(s.implied, Math.round(s.implied * Math.exp(lowConf ? validation.band80.q90 : validation.band.q75)));
+    // Where the range's ends would sit in the board's point-value ordering: 1 + the rows (other than this one) strictly above.
+    const rankAt = (v: number): number => 1 + scored.reduce((n, o, j) => n + (j !== i && o.implied > v ? 1 : 0), 0);
     const m = s.breakdown;
     let v = s.base;
     const wf: [string, number | null, number][] = [['Base value: TVL x peer multiple', null, Math.round(v)]];
@@ -962,8 +1154,15 @@ function scoreBoard(snapshot: Snapshot, model: ModelConstants, validation: FitRe
     }
     wf.push(['Implied value', null, s.implied]);
     extras.set(s.p.slug, {
-      value_low: valueLow,
-      value_high: Math.max(s.implied, Math.round(s.implied * Math.exp(validation.band.q75))),
+      value_low: shownLow,
+      value_high: shownHigh,
+      range_level: lowConf ? 80 : 50,
+      value_p25: valueLow,
+      rank_low: rankAt(shownHigh),
+      rank_high: rankAt(shownLow),
+      confidence: lowConf ? 'low' : 'normal',
+      promoted: lowConf,
+      ...(lowConf ? { why: whyPromoted(s.p, s.breakdown, comps, snapshot.floor_usd) } : {}),
       cat_share: round4(shrunkShare(prop.counts, s.p.category, inScope ? s.p : null)),
       clamp_adj: round4(s.clamp),
       waterfall: wf,
@@ -981,6 +1180,11 @@ function scoreBoard(snapshot: Snapshot, model: ModelConstants, validation: FitRe
         ev_p25_wallet_usd: Math.round(evP25 * 100) / 100,
         ev_ratio: Math.round(fv.ratio * 100) / 100,
         ev_p25_ratio: Math.round(fv.ratio_p25 * 100) / 100,
+        break_even_value_usd: Math.round(fv.break_even),
+        net_point_usd: Math.round((ev - fv.all_in) * 100) / 100,
+        net_p25_usd: Math.round((evP25 - fv.all_in) * 100) / 100,
+        net_p25_roi_pct: Math.round(((evP25 - fv.all_in) / fv.all_in) * 1000) / 10,
+        deposit_net: fv.deposit_net,
       },
     });
     return {
@@ -1009,7 +1213,29 @@ function scoreBoard(snapshot: Snapshot, model: ModelConstants, validation: FitRe
       farm_verdict: fv.verdict,
     };
   });
-  return { board, extras };
+  return { board, extras, quarantined };
+}
+
+/** Why a rankable pre-token protocol outside the watchlist and the early rows is not priced, or null when it is promoted. */
+export function quarantineReason(p: SnapshotProtocol, floor: number): string | null {
+  if (!Number.isFinite(p.tvl_usd) || p.tvl_usd <= 0) return 'no usable TVL in the snapshot';
+  if (p.tvl_usd < floor) return `TVL ${wholeUsd(p.tvl_usd)} is below the ${wholeUsd(floor)} floor`;
+  if (p.chains.length === 0) return 'no chain listed, so no farm plan can name one';
+  return null;
+}
+
+/** The WHY line of a promoted row: the multiple's source, stated as the pipeline used it. */
+function whyPromoted(p: SnapshotProtocol, b: ModelBreakdown, comps: Comparables, floor: number): string {
+  const cat = catKey(p.category);
+  const kind = kindOfCategory(p.category);
+  const fam = comps.byKind.has(kind);
+  const n = b.peer_count;
+  const how =
+    n >= FIT.thin_peers ? `the category's shrunk multiple (${n} peers)`
+      : n >= 1 ? `the category's shrunk multiple (only ${n} peer${n === 1 ? '' : 's'}), blended with the ${kind} family median`
+        : fam ? `no peers in the category, so the ${kind} family median stands in for the global median (${comps.globalMedian.toFixed(4)})`
+          : `no peers in the category and no family, so the global median (${comps.globalMedian.toFixed(4)})`;
+  return `Promoted from the set-aside list: TVL ${wholeUsd(p.tvl_usd)} (floor ${wholeUsd(floor)}) and ${p.chains.length} chain${p.chains.length === 1 ? '' : 's'}. Multiple x${b.peer_multiple.toFixed(4)} for ${cat}: ${how}. Low confidence, shown with the 80% band.`;
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
@@ -1201,7 +1427,7 @@ export function radarRow(row: BoardRow, extra: RowExtras): RadarRow {
 }
 
 /** A disposition for every protocol, in priority order: tokenized, on the board, excluded product type, other pre-token. */
-export function coverage(snapshot: Snapshot, board: BoardRow[]): Coverage {
+export function coverage(snapshot: Snapshot, board: BoardRow[], extras: Map<string, RowExtras>): Coverage {
   const onBoard = new Set(board.map((r) => r.slug));
   const reasons: Record<string, number> = {};
   let tokenized = 0;
@@ -1218,14 +1444,14 @@ export function coverage(snapshot: Snapshot, board: BoardRow[]): Coverage {
   }
   const sortedReasons: Record<string, number> = {};
   for (const k of Object.keys(reasons).sort(cmp)) sortedReasons[k] = reasons[k]!;
-  return { total: snapshot.protocols.length, tokenized, ranked, excluded, excluded_reasons: sortedReasons, other_pre_token: other, floor_usd: snapshot.floor_usd, as_of: snapshot.as_of };
+  return { total: snapshot.protocols.length, tokenized, ranked, promoted: board.filter((r) => extras.get(r.slug)?.promoted === true).length, excluded, excluded_reasons: sortedReasons, quarantined: other, floor_usd: snapshot.floor_usd, as_of: snapshot.as_of };
 }
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const validation = validate(snapshot, model);
   const prop = fitPropensity(oddsScope(snapshot), snapshot.as_of);
-  const { board, extras } = scoreBoard(snapshot, model, validation, prop);
+  const { board, extras, quarantined } = scoreBoard(snapshot, model, validation, prop);
   const live = liveRows(snapshot);
   const comps = comparables(snapshot, model);
   const peers: PeerRow[] = [...comps.byCategory]
@@ -1241,7 +1467,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     protocols_scanned: snapshot.protocols.length,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
-    early_size: board.filter((r) => !r.watchlist).length,
+    early_size: board.filter((r) => !r.watchlist && !extras.get(r.slug)!.promoted).length,
+    promoted_size: board.filter((r) => extras.get(r.slug)!.promoted).length,
     live_size: live.length,
     global_median_multiple: round4(comps.globalMedian),
     peer_cap_multiple: round4(comps.cap),
@@ -1250,7 +1477,9 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     live,
     peers,
     fit: validation,
-    coverage: coverage(snapshot, board),
+    coverage: coverage(snapshot, board, extras),
+    quarantined,
+    integrity: [],
     odds: oddsReport(snapshot, prop),
     farm: {
       airdrop_pool_share: FIT.airdrop_pool_share,
@@ -1268,7 +1497,108 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     },
     recon: { rows: board.length, sum_implied_usd: board.reduce((t, r) => t + r.implied_value_usd, 0), build: fnv1a(board.map((r) => r.slug + r.implied_value_usd).join('')) },
   };
+  radar.integrity = integrityChecks(snapshot, board, radar);
   return { board, radar };
+}
+
+/** A name normalised for comparison: lower case, runs of other characters as one hyphen. */
+const normName = (t: string): string => t.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+
+/** Every quoted string (single, double or template) in a source text, as the text between the quotes. */
+const STRING_LITERAL = /'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`/g;
+
+/**
+ * The no-hardcoded-names scan. A slug hit is a string literal that equals a board slug exactly. A name coincidence is a
+ * literal that equals a protocol's name once case and punctuation are normalised; it is reported, and it does not fail
+ * the check, because a chain's name in the cost-tier table can be a protocol's name too.
+ */
+export function literalNameHits(source: string, slugs: Set<string>, names: Set<string>): { literals: number; hits: string[]; coincidences: string[] } {
+  const found = (source.match(STRING_LITERAL) ?? []).map((l) => l.slice(1, -1));
+  const hits = [...new Set(found.filter((l) => slugs.has(l)))].sort(cmp);
+  const coincidences = [...new Set(found.filter((l) => !slugs.has(l) && names.has(normName(l))))].sort(cmp);
+  return { literals: found.length, hits, coincidences };
+}
+
+/** The build's integrity checks, each computed from the finished board and data, never typed. */
+export function integrityChecks(snapshot: Snapshot, board: BoardRow[], radar: RadarData): IntegrityCheck[] {
+  const out: IntegrityCheck[] = [];
+  const check = (id: string, label: string, value: string, short: string, pass: boolean | null, kind: IntegrityCheck['kind'] = 'check'): void => { out.push({ id, label, value, short, pass, kind }); };
+
+  // 1. Coverage: each protocol gets one disposition, tested in this order; none may be left over.
+  const onBoard = new Set(board.map((r) => r.slug));
+  const set = new Set(radar.quarantined.map((q) => q.slug));
+  const n = { ranked: 0, tokenized: 0, excluded: 0, quarantined: 0, unaccounted: 0 };
+  for (const p of snapshot.protocols) {
+    if (!isPreToken(p)) n.tokenized++;
+    else if (onBoard.has(p.slug)) n.ranked++;
+    else if (excludeReason(p) !== null) n.excluded++;
+    else if (set.has(p.slug)) n.quarantined++;
+    else n.unaccounted++;
+  }
+  const total = snapshot.protocols.length;
+  const sum = n.ranked + n.tokenized + n.excluded + n.quarantined;
+  const c = radar.coverage;
+  const agrees = c.ranked === n.ranked && c.tokenized === n.tokenized && c.excluded === n.excluded && c.quarantined === n.quarantined;
+  check('coverage', 'Coverage', `${n.ranked} ranked (${radar.promoted_size} promoted) + ${n.tokenized} tokenized + ${n.excluded} product-excluded + ${n.quarantined} quarantined = ${sum} of ${total}; ${n.unaccounted} unaccounted`, `${sum}/${total}, ${n.unaccounted} unaccounted`, sum === total && n.unaccounted === 0 && agrees);
+
+  // 2. Board invariants.
+  const positive = board.every((r) => Number.isSafeInteger(r.implied_value_usd) && r.implied_value_usd > 0);
+  const ordered = board.every((r, i) => i === 0 || r.implied_value_usd <= board[i - 1]!.implied_value_usd);
+  const watched = snapshot.watchlist.filter((w) => onBoard.has(w)).length;
+  check('invariants', 'Board invariants', `${board.length} values ${positive ? 'positive' : 'NOT all positive'}, ${ordered ? 'non-increasing by rank' : 'NOT ordered'}; watchlist ${watched}/${snapshot.watchlist.length}`, `${board.length} rows, watchlist ${watched}/${snapshot.watchlist.length}`, positive && ordered && watched === snapshot.watchlist.length);
+
+  // 3. No hardcoded names: a real scan of this file's own source, with a positive control so a blind scanner cannot pass.
+  const slugSet = new Set(board.map((r) => r.slug));
+  const names = new Set(board.map((r) => normName(r.name)));
+  let nameValue: string;
+  let nameShort = 'unreadable';
+  let namePass: boolean;
+  try {
+    const source = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+    const scan = literalNameHits(source, slugSet, names);
+    const control = literalNameHits("const a = 'sample-slug';", new Set(['sample-slug']), new Set()).hits.length === 1;
+    namePass = scan.hits.length === 0 && control;
+    nameShort = `${scan.hits.length} of ${board.length} slugs in source`;
+    nameValue = `scanned ${scan.literals} string literals in lib/model.ts (${Buffer.byteLength(source)} bytes) for exact matches of ${board.length} board slugs: ${scan.hits.length} found${scan.hits.length > 0 ? ` (${scan.hits.join(', ')})` : ''}; positive control ${control ? 'caught a planted slug' : 'FAILED'}${scan.coincidences.length > 0 ? `; name-only coincidence, not a slug: ${scan.coincidences.join(', ')} (a chain name in the cost-tier table)` : ''}`;
+  } catch {
+    namePass = false;
+    nameValue = 'lib/model.ts could not be read, so nothing was scanned';
+  }
+  check('names', 'No hardcoded names', nameValue, nameShort, namePass);
+
+  // 4. Farm reconciliation: point EV, P25 EV and all-in cost rebuilt from each row's printed inputs, then the verdict rule applied.
+  let bad = 0;
+  const near = (a: number, b: number, tol: number): boolean => Math.abs(a - b) <= tol;
+  for (const r of radar.rows) {
+    const pl = r.plan;
+    const ev = (r.implied_value_usd * r.launch_odds * FIT.airdrop_pool_share) / pl.participants;
+    const evP25 = (r.value_p25 * r.launch_odds * FIT.airdrop_pool_share) / pl.participants;
+    const allIn = r.farm_cost_usd + r.farm_hours * FIT.hour_value_usd + (pl.deposit_usd * FIT.capital_apr * (pl.hold_days / 7)) / 52;
+    const label = ev / allIn >= FIT.worth_ratio && evP25 / allIn >= FIT.worth_p25_floor ? 'Worth it' : ev / allIn >= FIT.marginal_ratio ? 'Marginal' : 'Skip';
+    const breakEven = (allIn * pl.participants) / (FIT.airdrop_pool_share * r.launch_odds);
+    const ok = near(ev, pl.ev_wallet_usd, 0.0051) && near(evP25, pl.ev_p25_wallet_usd, 0.0051) && near(allIn, pl.all_in_usd, 0.0051) &&
+      near(breakEven, pl.break_even_value_usd, 1) && near(evP25 - allIn, pl.net_p25_usd, 0.0101) && near(ev - allIn, pl.net_point_usd, 0.0101) &&
+      label === r.farm_verdict.split(':')[0] && r.farm_verdict.includes(`Break-even launch value ${wholeUsd(breakEven)}`);
+    if (!ok) bad++;
+  }
+  check('farm', 'Farm reconciliation', `${radar.rows.length} rows rebuilt (point EV, P25 EV, all-in, break-even, verdict label): ${bad} mismatches`, `${bad} mismatches in ${radar.rows.length} rows`, bad === 0);
+
+  // 5. The validation ladder, as text.
+  const L = radar.fit.ladder;
+  check('ladder', 'Validation ladder', L.summary, `full ${L.rows[2]!.errors.map((v) => v.toFixed(2)).join('/')} vs naive ${L.rows[0]!.errors.map((v) => v.toFixed(2)).join('/')}`, null, 'info');
+
+  // 6. Band coverage against nominal.
+  const pct = (b: { coverage: number; inside: number; n: number }): string => `${(b.coverage * 100).toFixed(1)}% (${b.inside}/${b.n})`;
+  check('bands', 'Band coverage', `walk-forward: 50% band ${pct(radar.fit.band)} vs 50% nominal; 80% band ${pct(radar.fit.band80)} vs 80% nominal`, `50%: ${(radar.fit.band.coverage * 100).toFixed(1)}% · 80%: ${(radar.fit.band80.coverage * 100).toFixed(1)}%`, null, 'info');
+
+  // 7. The build hash: recomputed from the board and from the data the page reads, against the reconciliation line.
+  const hashBoard = fnv1a(board.map((r) => r.slug + r.implied_value_usd).join(''));
+  const hashData = fnv1a(radar.rows.map((r) => r.slug + r.implied_value_usd).join(''));
+  check('hash', 'Build hash', `${radar.recon.build} (board.json ${hashBoard}, data.js ${hashData})`, radar.recon.build, hashBoard === radar.recon.build && hashData === radar.recon.build);
+
+  const limit = `${radar.peer_total} peers; bands are wide for thin categories.`;
+  check('limit', 'Known limit', limit, limit, null, 'limit');
+  return out;
 }
 
 /** The calibration in a few lines: model, peers, out-of-sample errors (5-fold and walk-forward), band coverage and Brier. */
@@ -1279,7 +1609,8 @@ export function calibrationSummary(radar: RadarData): string {
   return (
     `model ${radar.model_version}, ${radar.peer_total} peers, global median x${radar.global_median_multiple}, cap x${radar.peer_cap_multiple}; ${fitText}\n` +
     `token radar: ${f.cv.folds}-fold OOF median abs log error ${f.cv.fitted} fitted vs ${f.cv.baseline} category-only (${f.cv.n} peers); walk-forward ${f.walk.fitted} fitted vs ${f.walk.baseline} category-only (${f.walk.n_fit} fit / ${f.walk.n} test, ${f.walk.undated} undated counted oldest)\n` +
-    `token radar: band P25/P75 of OOF residual ${f.band.q25}/${f.band.q75}, walk-forward coverage ${(f.band.coverage * 100).toFixed(1)}% (${f.band.inside}/${f.band.n}); propensity Brier ${o.brier_propensity} vs base rate ${o.brier_base} (${o.n_train} fit / ${o.n_test} held, scope ${o.n_scope})`
+    `token radar: band P25/P75 of OOF residual ${f.band.q25}/${f.band.q75}, walk-forward coverage ${(f.band.coverage * 100).toFixed(1)}% (${f.band.inside}/${f.band.n}); propensity Brier ${o.brier_propensity} vs base rate ${o.brier_base} (${o.n_train} fit / ${o.n_test} held, scope ${o.n_scope})\n` +
+    `token radar: 80% band P10/P90 ${f.band80.q10}/${f.band80.q90}, walk-forward coverage ${(f.band80.coverage * 100).toFixed(1)}% (${f.band80.inside}/${f.band80.n})`
   );
 }
 
@@ -1287,7 +1618,7 @@ export function calibrationSummary(radar: RadarData): string {
 export function coverageSummary(radar: RadarData): string {
   const c = radar.coverage;
   const why = Object.entries(c.excluded_reasons).map(([k, v]) => `${v} ${k}`).join(', ');
-  return `coverage ${c.total} = ${c.ranked} ranked + ${c.tokenized} tokenized + ${c.excluded} excluded as product type (${why}) + ${c.other_pre_token} other pre-token not ranked (floor $${c.floor_usd.toLocaleString('en-US')}, as of ${c.as_of})`;
+  return `coverage ${c.total} = ${c.ranked} ranked (${c.promoted} promoted, low confidence) + ${c.tokenized} tokenized + ${c.excluded} excluded as product type (${why}) + ${c.quarantined} quarantined, not priced (floor $${c.floor_usd.toLocaleString('en-US')}, as of ${c.as_of})`;
 }
 
 /** The snapshot out of a file's text, refused unless it is the shape the model scores. */

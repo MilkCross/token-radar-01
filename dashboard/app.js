@@ -7,8 +7,9 @@
   var rows = D.rows;
   var S = { q: '', cat: '', chain: '', wl: false, early: false, pos: false, verdict: '', tvl: 0, key: 'rank', dir: 1, sel: rows[0].slug };
   var view = 'board';
-  var lnLo = Math.log(Math.min.apply(null, rows.map(function (r) { return r.value_low; })));
-  var lnSpan = Math.log(Math.max.apply(null, rows.map(function (r) { return r.value_high; }))) - lnLo;
+  var base = rows.filter(function (r) { return !r.promoted; });
+  var lnLo = Math.log(Math.min.apply(null, base.map(function (r) { return r.value_low; })));
+  var lnSpan = Math.log(Math.max.apply(null, base.map(function (r) { return r.value_high; }))) - lnLo;
 
   function fmtUsd(n) {
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
@@ -26,6 +27,8 @@
   function fmtOdds(o) { return Math.round(o * 100) + '%'; }
   function full(n) { return '$' + n.toLocaleString('en-US'); }
   function range(r) { return fmtUsd(r.value_low) + ' – ' + fmtUsd(r.value_high); }
+  function rband(r) { return r.range_level === 80 ? 'P10–P90' : 'P25–P75'; }
+  function rrange(r) { return '[' + r.rank_low + '–' + r.rank_high + ']'; }
   function gainWord(a, b) { var g = Math.round((1 - a / b) * 100); return g + '% lower, a ' + (g < 10 ? 'small' : g < 25 ? 'modest' : 'clear') + ' gain'; }
 
   function el(tag, attrs) {
@@ -56,6 +59,7 @@
       el('thead', {}, el('tr', {}, heads.map(function (h, i) { return el('th', { class: i >= ni ? 'n' : '', text: h }); }))),
       el('tbody', {}, data.map(function (r) { return el('tr', { style: 'cursor:default' }, r.map(function (c, i) { return el('td', { class: i >= ni ? 'n' : '' }, c); })); }))));
   }
+  function sgn(n) { return (n < 0 ? '−$' : '$') + Math.abs(n).toFixed(2); }
   function p(text, cls) { return el('p', { class: cls || 'eq', text: text }); }
 
   // ---- header and tabs
@@ -71,7 +75,7 @@
   function modelLine() {
     return el('p', { class: 'model-line' },
       el('b', { text: D.model_version + ': ' }),
-      'implied value = TVL × peer mcap/TVL multiple (shrunk toward the global median of ' + fmtX(D.global_median_multiple) + ', from ' + D.peer_total + ' token-bearing peers; blended with the category family under 3 peers, capped at the peer p90 of ' + fmtX(D.peer_cap_multiple) + ') × size, growth, maturity and chain adjustments fitted by Huber regression (each clamped to 0.5–2, and so is their product). Ranges are the peers’ own P25–P75 miss. Odds are a launch propensity fitted on the peers’ record. Every figure comes from the snapshot. Values are implied circulating market cap, from peers’ circulating mcap/TVL — not FDV; the snapshot has no supply or unlock schedules. Cross-sectional peer benchmark, out-of-fold median abs log error ' + D.fit.error_fitted.toFixed(2) + '; not a price forecast.');
+      'implied value = TVL × peer mcap/TVL multiple (shrunk toward the global median of ' + fmtX(D.global_median_multiple) + ', from ' + D.peer_total + ' token-bearing peers; blended with the category family under 3 peers, capped at the peer p90 of ' + fmtX(D.peer_cap_multiple) + ') × size, growth, maturity and chain adjustments fitted by Huber regression (each clamped to 0.5–2, and so is their product). Ranges are the peers’ own P25–P75 miss (P10–P90 for low-confidence rows). Odds are a launch propensity fitted on the peers’ record. Validated against a ladder of naive, category-only and full models (5-fold, repeated 10-fold, leave-one-out, walk-forward). Every figure comes from the snapshot. Values are implied circulating market cap, from peers’ circulating mcap/TVL — not FDV; the snapshot has no supply or unlock schedules. Cross-sectional peer benchmark, out-of-fold median abs log error ' + D.fit.error_fitted.toFixed(2) + '; not a price forecast.');
   }
   function tabs() {
     var defs = [['board', 'Board'], ['model', 'Model'], ['comparables', 'Comparables'], ['live', 'Live tokens']];
@@ -84,7 +88,7 @@
   function kpi(v, label) { return el('div', { class: 'kpi' }, el('b', { text: String(v) }), el('span', { text: label })); }
   function coverageLine() {
     var c = D.coverage, w = Object.keys(c.excluded_reasons).map(function (k) { return c.excluded_reasons[k] + ' ' + k; }).join(', ');
-    return c.total + ' = ' + c.ranked + ' ranked + ' + c.tokenized + ' tokenized + ' + c.excluded + ' excluded as product type (' + w + ') + ' + c.other_pre_token + ' other pre-token not ranked';
+    return c.total + ' = ' + c.ranked + ' ranked (' + c.promoted + ' promoted, low conf.) + ' + c.tokenized + ' tokenized + ' + c.excluded + ' excluded as product type (' + w + ') + ' + c.quarantined + ' quarantined';
   }
   function fitPanel() {
     var f = D.fit;
@@ -97,25 +101,38 @@
   }
   function coveragePanel() {
     var c = D.coverage, ex = c.excluded_reasons;
-    var rowsC = [['Already tokenized', c.tokenized], ['On the board', c.ranked], ['Excluded as product type', c.excluded]].concat(Object.keys(ex).map(function (k) { return ['  of which ' + k, ex[k]]; })).concat([['Other pre-token, not ranked', c.other_pre_token], ['Total', c.total]]);
+    var rowsC = [['Already tokenized', c.tokenized], ['On the board', c.ranked], ['  of which promoted, low conf.', c.promoted], ['Excluded as product type', c.excluded]].concat(Object.keys(ex).map(function (k) { return ['  of which ' + k, ex[k]]; })).concat([['Quarantined, not priced', c.quarantined], ['Total', c.total]]);
+    var q = D.quarantined;
     return card('Coverage: every protocol accounted for',
       el('dl', { class: 'facts' }, [].concat.apply([], rowsC.map(function (x) { return fact(x[0], x[1]); }))),
+      el('h4', { text: 'Set aside — not priced' }),
+      q.length ? tbl(['Protocol', 'Category', 'TVL', 'Reason'], q.map(function (x) { return [x.name, x.category || 'Uncategorized', fmtUsd(x.tvl_usd), x.reason]; }), 2) : p('None. All ' + D.promoted_size + ' protocols set aside by radar-5 have a TVL at the floor and a chain, so each was priced and promoted, tagged low confidence.'),
       p('Buckets are exclusive, in priority order. Floor $' + c.floor_usd.toLocaleString('en-US') + ' TVL, snapshot ' + c.as_of + '.'));
+  }
+  function chips() {
+    return el('div', { class: 'chips', role: 'list', 'aria-label': 'Integrity checks, computed at build time' }, D.integrity.map(function (c) {
+      var st = c.pass === null ? (c.kind === 'limit' ? 'lim' : 'inf') : c.pass ? 'ok' : 'bad';
+      return el('span', { class: 'chip ' + st, role: 'listitem', title: c.label + ': ' + c.value },
+        el('i', { 'aria-hidden': 'true', text: c.pass === null ? (c.kind === 'limit' ? '!' : 'i') : c.pass ? '✓' : '✗' }),
+        c.kind === 'limit' ? null : el('b', { text: c.label }), c.short);
+    }));
   }
   function strip() {
     var f = D.fit, rc = D.recon;
-    return el('div', { class: 'strip' },
+    return el('div', { class: 'strip' }, chips(),
       el('div', { class: 'kpis' }, kpi(D.as_of, 'snapshot'), kpi(D.board_size, 'board rows'), kpi(D.peer_total, 'peers used'),
         kpi(f.error_fitted.toFixed(2) + ' vs ' + f.error_median_only.toFixed(2), 'out-of-fold error: fitted vs category only'), kpi(D.coverage.total, 'protocols accounted for')),
       p(rc.rows + ' rows · Σ implied ' + full(rc.sum_implied_usd) + ' · build ' + rc.build, 'cov'),
       p(coverageLine(), 'cov'),
-      el('details', {}, el('summary', { text: 'Model fit, validation and coverage' }), el('div', { class: 'grid' }, fitPanel(), coveragePanel())));
+      el('details', {}, el('summary', { text: 'Integrity checks in full, model fit, validation and coverage' }),
+        el('div', { class: 'prose mb' }, D.integrity.map(function (c) { return el('p', {}, el('b', { text: (c.pass === false ? 'FAILED · ' : '') + c.label + ': ' }), c.value); })),
+        el('div', { class: 'grid' }, fitPanel(), coveragePanel())));
   }
 
   // ---- board
   var COLS = [
     ['rank', 'Rank', true], ['name', 'Protocol', false], ['category', 'Category', false], ['chains', 'Chains', true],
-    ['tvl_usd', 'TVL', true], ['change_7d', '7d %', true], ['age_days', 'Age', true], ['implied_value_usd', 'Implied value', true], ['launch_odds', 'Odds', true], ['risk_adjusted_usd', 'Adj. value', true], ['why', 'Why', true]
+    ['tvl_usd', 'TVL', true], ['change_7d', '7d %', true], ['age_days', 'Age', true], ['implied_value_usd', 'Implied value', true], ['launch_odds', 'Odds', true], ['risk_adjusted_usd', 'Launch EV', true], ['why', 'Why', true]
   ];
   function sortVal(r, k) {
     if (k === 'chains') return r.chains.length;
@@ -130,7 +147,7 @@
       if (S.cat && (r.category || 'Uncategorized') !== S.cat) return false;
       if (S.chain && r.chains.indexOf(S.chain) < 0) return false;
       if (S.wl && !r.watchlist) return false;
-      if (S.early && r.watchlist) return false;
+      if (S.early && (r.watchlist || r.promoted)) return false;
       if (S.pos && !(r.change_7d !== null && r.change_7d > 0)) return false;
       if (S.tvl && r.tvl_usd < S.tvl) return false;
       if (S.verdict && vlabel(r) !== S.verdict) return false;
@@ -203,20 +220,21 @@
         pane.scrollTop = 0;
         try { history.replaceState(null, '', '#/p/' + r.slug); } catch (e) { /* file:// may refuse */ }
       };
-      var pos = function (v) { return ((Math.log(v) - lnLo) / lnSpan * 100).toFixed(1) + '%'; };
+      var pc = function (v) { return Math.min(100, Math.max(0, (Math.log(v) - lnLo) / lnSpan * 100)); };
+      var pos = function (v) { return pc(v).toFixed(1) + '%'; };
       tr = el('tr', { tabindex: '0', class: r.slug === S.sel ? 'sel' : '', onclick: open, onkeydown: function (e) { if (e.key === 'Enter') open(); } },
-        el('td', { class: 'n dim', text: '#' + r.rank }),
-        el('td', { class: 'name' }, r.name, el('span', { class: 'badge ' + (r.watchlist ? 'wl' : 'early'), text: r.watchlist ? 'WL' : 'New', title: r.watchlist ? 'Watchlist' : 'Early row' })),
+        el('td', { class: 'n dim', title: 'Rank ' + r.rank + '; its ' + rband(r) + ' range would rank ' + r.rank_low + ' to ' + r.rank_high }, '#' + r.rank, el('small', { text: rrange(r) })),
+        el('td', { class: 'name' }, r.name, el('span', { class: 'badge ' + (r.promoted ? 'low' : r.watchlist ? 'wl' : 'early'), text: r.promoted ? 'low conf.' : r.watchlist ? 'WL' : 'New', title: r.promoted ? 'Promoted from the set-aside list; 80% band' : r.watchlist ? 'Watchlist' : 'Early row' })),
         el('td', { class: 'cat dim', text: r.category || 'Uncategorized' }),
         el('td', { class: 'n dim', text: String(r.chains.length), title: r.chains.join(', ') }),
         el('td', { class: 'n', text: fmtUsd(r.tvl_usd) }),
         pctCell(r.change_7d),
         el('td', { class: 'n dim', text: fmtAge(r.age_days) }),
-        el('td', { class: 'n val', title: 'Range ' + range(r) + " (peers' P25–P75)" }, el('span', { text: fmtUsd(r.implied_value_usd) }),
-          el('span', { class: 'wh', 'aria-hidden': 'true' }, el('i', { style: 'left:' + pos(r.value_low) + ';width:' + ((Math.log(r.value_high) - Math.log(r.value_low)) / lnSpan * 100).toFixed(1) + '%' }), el('b', { style: 'left:' + pos(r.implied_value_usd) }))),
+        el('td', { class: 'n val', title: 'Range ' + range(r) + " (peers' " + rband(r) + ')' }, el('span', { text: fmtUsd(r.implied_value_usd) }),
+          el('span', { class: 'wh', 'aria-hidden': 'true' }, el('i', { style: 'left:' + pos(r.value_low) + ';width:' + (pc(r.value_high) - pc(r.value_low)).toFixed(1) + '%' }), el('b', { style: 'left:' + pos(r.implied_value_usd) }))),
         el('td', { class: 'n', text: fmtOdds(r.launch_odds), title: 'Fitted propensity; category basis ' + r.launch_basis.tokenized + ' tokenized vs ' + r.launch_basis.pre_token + ' pre-token' }),
-        el('td', { class: 'n val', text: fmtUsd(r.risk_adjusted_usd) }),
-        el('td', { class: 'n dim', text: why(r) }));
+        el('td', { class: 'n val', text: fmtUsd(r.risk_adjusted_usd), title: 'Launch EV = value × odds' }),
+        el('td', { class: 'n dim', text: why(r), title: r.why || '' }));
       return tr;
     });
     box.appendChild(el('table', {}, el('thead', {}, head), el('tbody', {}, body)));
@@ -234,8 +252,8 @@
       var end = i === 0 || i === w.length - 1;
       return [x[0], x[1] === null ? '' : '×' + x[1].toFixed(2), full(x[2]), el('span', { class: 'wfw' }, el('span', { class: 'wf' + (end ? ' end' : ''), style: 'width:' + Math.max(2, (Math.log(x[2]) - lo) / hi * 100).toFixed(1) + '%' }))];
     });
-    data.push(['Range (peers’ P25–P75)', '', full(r.value_low) + ' – ' + full(r.value_high), '']);
-    return card('Valuation waterfall', tbl(['Step', 'Factor', 'Value', ''], data, 1), p('Each factor is the fitted, clamped adjustment; their product is clamped to 0.5–2' + (r.clamp_adj !== 1 ? ' (here it binds: ×' + r.clamp_adj.toFixed(2) + ')' : '') + '. The last row scales the implied value by the peers’ out-of-fold P25 and P75 misses.'));
+    data.push(['Range (peers’ ' + rband(r) + ')', '', full(r.value_low) + ' – ' + full(r.value_high), '']);
+    return card('Valuation waterfall', tbl(['Step', 'Factor', 'Value', ''], data, 1), p('Each factor is the fitted, clamped adjustment; their product is clamped to 0.5–2' + (r.clamp_adj !== 1 ? ' (here it binds: ×' + r.clamp_adj.toFixed(2) + ')' : '') + '. The last row scales the implied value by the peers’ out-of-fold ' + (r.range_level === 80 ? 'P10 and P90' : 'P25 and P75') + ' misses.'));
   }
   function nearest(r) {
     var n = r.nearest, N = r.model.peer_count, cross = n.some(function (x) { return x.cross; });
@@ -262,17 +280,18 @@
     return el('div', { class: 'mt' },
       el('div', { class: 'dhead' },
         el('div', {}, el('h2', { text: r.name }),
-          el('p', { class: 'sub' }, (r.category || 'Uncategorized') + ' · ' + (r.chains.join(', ') || 'no chain listed') + ' · rank #' + r.rank + ' of ' + rows.length,
-            el('span', { class: 'badge ' + (r.watchlist ? 'wl' : 'early'), text: r.watchlist ? 'Watchlist' : 'Early' }))),
+          el('p', { class: 'sub' }, (r.category || 'Uncategorized') + ' · ' + (r.chains.join(', ') || 'no chain listed') + ' · rank #' + r.rank + ' ' + rrange(r) + ' of ' + rows.length,
+            el('span', { class: 'badge ' + (r.promoted ? 'low' : r.watchlist ? 'wl' : 'early'), text: r.promoted ? 'low conf.' : r.watchlist ? 'Watchlist' : 'Early' }))),
         el('div', {}, el('p', { class: 'sub', text: 'Implied value · ' + fmtOdds(r.launch_odds) + ' propensity → ' + fmtUsd(r.risk_adjusted_usd) }), el('div', { class: 'big', text: fmtUsd(r.implied_value_usd) }),
-          el('p', { class: 'sub', text: 'Range ' + range(r) + ' (peers’ P25–P75)' }))),
+          el('p', { class: 'sub', text: 'Range ' + range(r) + ' (peers’ ' + rband(r) + ')' }))),
+      r.why ? p(r.why, 'verdict amber mt') : null,
       el('div', { class: 'grid w2' },
         card('Snapshot figures',
           el('dl', { class: 'facts' },
             fact('Slug', r.slug), el('dt', { class: 'wide', text: 'Basis: circulating mcap/TVL (not FDV)' }), fact('TVL', full(r.tvl_usd)), fact('TVL change 7d', fmtPct(r.change_7d)),
             fact('Listed', r.listed_at || 'n/a'), fact('Age', r.age_days === null ? 'n/a (365d assumed)' : r.age_days + ' days'),
             fact('Chains', String(r.chains.length)), fact('Token', 'none recorded'),
-            fact('Implied value', full(r.implied_value_usd)), fact('Range (P25–P75)', full(r.value_low) + ' – ' + full(r.value_high)),
+            fact('Implied value', full(r.implied_value_usd)), fact('Range (' + rband(r) + ')', full(r.value_low) + ' – ' + full(r.value_high)), fact('Rank range', rrange(r)),
             fact('Launch propensity', fmtOdds(r.launch_odds)), fact('Basis: category share', Math.round(r.cat_share * 100) + '% (' + lb.tokenized + ' tokenized vs ' + lb.pre_token + ' pre-token)'),
             fact('Risk-adjusted', full(r.risk_adjusted_usd)), fact('Model confidence', Math.round(m.confidence * 100) + '%'))),
         card('Model breakdown',
@@ -292,8 +311,12 @@
           fact('All-in cost', '$' + pl.all_in_usd.toFixed(2)),
           fact('  fees', '$' + r.farm_cost_usd.toFixed(2)), fact('  hands-on time', r.farm_hours.toFixed(1) + 'h × $' + F.hour_value_usd + ' = $' + (r.farm_hours * F.hour_value_usd).toFixed(2)),
           fact('  capital opportunity', '$' + pl.deposit_usd.toLocaleString('en-US') + ' × ' + (F.capital_apr * 100).toFixed(1) + '% × ' + pl.hold_weeks.toFixed(1) + '/52 wk = $' + pl.opportunity_usd.toFixed(2)),
-          fact('EV / cost', pl.ev_ratio.toFixed(2) + 'x point, ' + pl.ev_p25_ratio.toFixed(2) + 'x P25')),
-        p('Chains ' + pl.chains.map(function (c) { return c.name + ' (tier ' + c.tier + ', $' + c.cost_usd + ')'; }).join(', ') + ' = $' + pl.chain_cost_usd + ' round trip. About ' + pl.participants.toLocaleString('en-US') + ' wallets share a ' + (F.airdrop_pool_share * 100) + '% pool: EV = implied × propensity × ' + (F.airdrop_pool_share * 100) + '% / wallets; P25 EV uses the P25 value. Worth it: point EV ≥ ' + F.worth_ratio + 'x all-in and P25 EV ≥ ' + F.worth_p25_floor + 'x all-in. Marginal: point EV ≥ ' + F.marginal_ratio + 'x all-in but not Worth it. Skip: point EV < ' + F.marginal_ratio + 'x.'),
+          fact('EV / cost', pl.ev_ratio.toFixed(2) + 'x point, ' + pl.ev_p25_ratio.toFixed(2) + 'x P25'),
+          fact('Net at point EV', sgn(pl.net_point_usd)), fact('Net at P25', sgn(pl.net_p25_usd) + ' (ROI ' + pl.net_p25_roi_pct.toFixed(0) + '% of cost)'),
+          fact('Break-even launch value', full(pl.break_even_value_usd) + ' vs ' + full(r.implied_value_usd) + ' implied')),
+        tbl(['Deposit', 'Opportunity', 'Net (point EV − all-in)'], pl.deposit_net.map(function (d) { var op = d[0] * F.capital_apr * pl.hold_days / 7 / 52; return ['$' + d[0].toLocaleString('en-US'), '$' + op.toFixed(2), sgn(d[1])]; }), 1),
+        p('Proceeds are an equal per-wallet split of the ' + (F.airdrop_pool_share * 100) + '% pool, so deposit size moves only the opportunity cost; the other rows reprice that term alone.'),
+        p('Chains ' + pl.chains.map(function (c) { return c.name + ' (tier ' + c.tier + ', $' + c.cost_usd + ')'; }).join(', ') + ' = $' + pl.chain_cost_usd + ' round trip. About ' + pl.participants.toLocaleString('en-US') + ' wallets share a ' + (F.airdrop_pool_share * 100) + '% pool: EV = implied × propensity × ' + (F.airdrop_pool_share * 100) + '% / wallets (Launch EV in the table is value × odds); P25 EV uses the P25 value; break-even = all-in × wallets / (' + (F.airdrop_pool_share * 100) + '% × odds). Worth it: point EV ≥ ' + F.worth_ratio + 'x all-in and P25 EV ≥ ' + F.worth_p25_floor + 'x all-in. Marginal: point EV ≥ ' + F.marginal_ratio + 'x all-in but not Worth it. Skip: point EV < ' + F.marginal_ratio + 'x.'),
         el('ol', { class: 'plan mt' }, steps)));
   }
 
@@ -316,20 +339,38 @@
     d.innerHTML = s;
     return card('Calibration: out-of-fold predicted vs actual', d, p(pts.length + ' peers, each predicted by a model that never saw it (5-fold). The dashed line is a perfect call; the spread around it is the miss the ranges express.'));
   }
+  function ladderCards() {
+    var L = D.fit.ladder, E = function (x) { return x.toFixed(3); };
+    var tb = tbl(['Variant'].concat(L.schemes), L.rows.map(function (r) {
+      return [r.label].concat(r.errors.map(function (e, i) { return el('span', {}, E(e), el('small', { class: 'dim', text: r.id === 'naive' ? '' : ' ×' + r.vs_naive[i].toFixed(2) + (r.id === 'full' ? ' / ×' + r.vs_category[i].toFixed(2) : '') })); }));
+    }), 1);
+    var A = L.ablation, C = L.loco;
+    return el('div', {},
+      el('div', { class: 'mb' }, card('Validation ladder: median abs log error',
+        tb, p('Every cell refits the multiples, shrinkage and Huber fit inside its own training part. Ratios beside each error: × naive, and for the full model × category-only. Predictions behind each scheme: ' + L.n.join(' / ') + '; repeated 10-fold is ' + L.repeats + ' balanced hash-ordered repeats, pooled. The 5-fold figure is the best of the four; the larger, harder schemes shrink the full model’s edge.'),
+        p(L.note))),
+      el('div', { class: 'grid mb' }, card('Per-term ablation',
+        tbl(['Dropped term (5-fold)', 'Error', 'Δ vs full ' + E(A.full)], A.terms.map(function (t) { return [t.term, E(t.error), (t.delta >= 0 ? '+' : '') + E(t.delta)]; }), 1),
+        p('Terms whose removal changes nothing add nothing out of sample here; only size carries the fit.')),
+      card('Leave-one-category-out',
+        p('Full model on ' + C.categories + ' categories it never saw (' + C.n + ' peers): ' + E(C.full) + ' vs ' + E(C.category_only) + ' category-only and ' + E(C.naive) + ' naive. Categories with at least 4 peers; the held-out category falls back to its family or the global median.'),
+        tbl(['Held-out category', 'n', 'Full', 'Cat.-only', 'Naive'], C.by_category.map(function (c) { return [c.category, String(c.n), E(c.full), E(c.category_only), E(c.naive)]; }), 1))));
+  }
   function modelView() {
     var f = D.fit, o = D.odds, F = D.farm, b = f.band, w = f.walk, dl = F.dilution, dp = F.deposit;
     var pct = function (x) { return (x * 100).toFixed(1) + '%'; };
     var tiers = F.tiers.map(function (t) { return ['Tier ' + t.tier, t.label, '$' + t.cost_usd]; });
     return el('div', {},
-      p('Two out-of-sample checks of the same model, side by side. Where the fitted gain is small the table says so.', 'note'),
+      p('The same model, checked four ways, with its parts removed one at a time. Where the fitted gain is small the tables say so.', 'note'),
       p('Basis: values are implied circulating market cap, from peers’ circulating mcap/TVL (not FDV). The snapshot has no supply or unlock schedules, so no fully diluted value can be derived. These checks measure a cross-sectional peer benchmark, not a price forecast.', 'note'),
+      ladderCards(),
       el('div', { class: 'grid mb' },
         valCard('Validation 1: 5-fold cross-validation', f.cv, f.cv.n + ' peers predicted out of fold: each fold is refit (category multiples and Huber fit) on the other four; fold = sum of the slug’s char codes mod ' + f.cv.folds + '.'),
         valCard('Validation 2: walk-forward', w, 'Fit on the earliest ' + w.n_fit + ' peers by listed date, tested on the latest ' + w.n + ' (listed ' + w.from + ' to ' + w.to + '; the ' + w.undated + ' undated peers count as oldest). A smaller, harder test.')),
       el('div', { class: 'grid mb' },
         card('Ranges and their coverage',
           p('Value ranges are the peers’ own P25–P75 miss: the out-of-fold residual ln(actual / predicted) has quartiles ' + b.q25.toFixed(2) + ' and +' + b.q75.toFixed(2) + ', so a row’s range is its implied value × ' + Math.exp(b.q25).toFixed(2) + ' to × ' + Math.exp(b.q75).toFixed(2) + '.', 'prose'),
-          p('On the walk-forward test, ' + b.inside + ' of ' + b.n + ' peers (' + pct(b.coverage) + ') had an actual market cap inside their band; a P25–P75 band aims at 50%. The quartiles come from out-of-fold residuals that include these peers, so the figure is slightly flattering. The bands are wide: the model gives scale, not a price.', 'prose')),
+          p('On the walk-forward test, ' + b.inside + ' of ' + b.n + ' peers (' + pct(b.coverage) + ') had an actual market cap inside their band; a P25–P75 band aims at 50%. The 80% band (P10–P90, residuals ' + D.fit.band80.q10.toFixed(2) + ' and +' + D.fit.band80.q90.toFixed(2) + ') held ' + D.fit.band80.inside + ' of ' + D.fit.band80.n + ' (' + pct(D.fit.band80.coverage) + ') against its nominal 80%, and is the range low-confidence rows show. The quartiles come from out-of-fold residuals that include these peers, so the figure is slightly flattering. The bands are wide: the model gives scale, not a price.', 'prose')),
         scatter()),
       el('div', { class: 'grid mb' }, fitPanel(),
         card('Launch propensity: fitted on the peers’ record',
@@ -345,6 +386,7 @@
             el('p', {}, el('b', { text: 'Deposit. ' }), el('code', { text: 'clamp(round(TVL × ' + dp.rate + ' / ' + dp.step + ') × ' + dp.step + ', $' + dp.min + ', $' + dp.max.toLocaleString('en-US') + ')' }), ' (returned on exit, not a cost).'),
             el('p', {}, el('b', { text: 'Expected value a wallet. ' }), 'implied × propensity × ' + (F.airdrop_pool_share * 100) + '% pool / wallets. One qualifying action costs ' + (F.action_fee_share * 100) + '% of the first chain’s round trip.'),
             el('p', {}, el('b', { text: 'All-in cost. ' }), 'fees + hands-on hours × $' + F.hour_value_usd + '/h + capital opportunity = deposit × ' + (F.capital_apr * 100).toFixed(1) + '% APR × hold weeks / 52. Hold weeks is the plan’s own hold in days / 7 (the hold step: 21 to 60 days by age and TVL momentum); a fixed ' + F.hold_weeks_fallback + ' weeks would apply only to a plan with no hold, and none lacks one.'),
+            el('p', {}, el('b', { text: 'Launch EV. ' }), 'value × odds. Break-even launch value: all-in cost × wallets / (' + (F.airdrop_pool_share * 100) + '% × odds), the circulating value at which point EV a wallet equals the all-in cost.'),
             el('p', {}, el('b', { text: 'Verdict. ' }), 'P25 EV a wallet = P25 value × propensity × ' + (F.airdrop_pool_share * 100) + '% / wallets. Worth it: point EV ≥ ' + F.worth_ratio + 'x all-in cost and P25 EV ≥ ' + F.worth_p25_floor + 'x all-in cost. Marginal: point EV ≥ ' + F.marginal_ratio + 'x all-in cost but not Worth it. Skip: point EV < ' + F.marginal_ratio + 'x all-in cost. The thresholds are not tuned to a target count.'),
             el('p', {}, el('b', { text: 'Tactics. ' }), '7d TVL above +5%: crowding caution and a hold capped at 21 days; below −5%: accumulate quietly. Listed under a year: early-user footprint; over 4 years: a sustained eight-week cadence.')))));
   }

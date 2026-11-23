@@ -153,3 +153,14 @@ dl.facts dt.wide { grid-column: 1 / -1; color: var(--ink); }
 #detail .wfw { width: 56px; }
 #detail td, #detail th { white-space: normal; }
 @media (max-width: 1100px) { .split { grid-template-columns: 1fr; } #detail { position: static; max-height: none; } .split .tablebox.scroll { max-height: 360px; } }
+
+.chips { display: flex; flex-wrap: wrap; gap: 4px 8px; margin-bottom: 8px; }
+.chip { display: inline-flex; align-items: center; gap: 4px; padding: 0 8px; border: 1px solid var(--line); background: var(--panel); font: 12px/22px var(--mono); color: var(--dim); }
+.chip b { color: var(--ink); font-weight: 600; }
+.chip i { font-style: normal; font-weight: 700; }
+.chip.ok { border-color: #1f5a47; } .chip.ok i { color: var(--up); }
+.chip.bad { border-color: var(--down); background: #3a1a17; color: var(--ink); } .chip.bad i { color: var(--down); }
+.chip.inf i, .chip.lim i { color: var(--amber); }
+td small { display: block; font: 10px/1 var(--mono); color: var(--dim); }
+.badge.low { color: var(--down); border-color: #6b3a35; }
+h4 { margin: 16px 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--amber); }

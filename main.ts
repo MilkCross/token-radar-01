@@ -87,23 +87,45 @@ for (const name of shots) {
 const dossier = buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } });
 writeFileSync(join(out, 'dossier.json'), dossier);
 
-// The self-check a run prints: watchlist coverage, top rows with odds and bands, verdict counts, sizes.
+// The self-check a run prints: watchlist coverage, verdicts (original rows apart from promoted ones), set-aside audit,
+// validation ladder, bands, sizes and the integrity checks.
 const slugs = new Set(board.map((r) => r.slug));
 const onBoard = snapshot.watchlist.filter((w) => slugs.has(w)).length;
-const verdicts: Record<string, number> = {};
-for (const r of board) {
-  const label = r.farm_verdict.split(':')[0]!;
-  verdicts[label] = (verdicts[label] ?? 0) + 1;
-}
+const promotedSlugs = new Set(radar.rows.filter((r) => r.promoted).map((r) => r.slug));
+const tally = (rows: typeof board): string => {
+  const verdicts: Record<string, number> = {};
+  for (const r of rows) {
+    const label = r.farm_verdict.split(':')[0]!;
+    verdicts[label] = (verdicts[label] ?? 0) + 1;
+  }
+  return Object.entries(verdicts).map(([k, v]) => `${k} ${v}`).join(', ');
+};
 const usd = (n: number): string => `$${n.toLocaleString('en-US')}`;
 const top5 = radar.rows.slice(0, 5).map((r) => `#${r.rank} ${r.name} ${usd(r.implied_value_usd)}, odds ${Math.round(r.launch_odds * 100)}%, band ${usd(r.value_low)} to ${usd(r.value_high)}`).join('\n  ');
+const lad = radar.fit.ladder;
+const f3 = (n: number): string => n.toFixed(3);
+const ladderTable = [
+  `  ${'variant'.padEnd(12)}${lad.schemes.map((s) => s.padStart(14)).join('')}   (n ${lad.n.join('/')})`,
+  ...lad.rows.map((r) => `  ${r.id.padEnd(12)}${r.errors.map((e) => f3(e).padStart(14)).join('')}   vs naive ${r.vs_naive.map(f3).join('/')}, vs category-only ${r.vs_category.map(f3).join('/')}`),
+].join('\n');
+const promotedLines = radar.rows.filter((r) => r.promoted).map((r) => `  #${r.rank} ${r.name} (${r.category ?? 'Uncategorized'}, TVL ${usd(r.tvl_usd)}, ${r.chains.length} chains): ${usd(r.implied_value_usd)}, range ${usd(r.value_low)} to ${usd(r.value_high)}, ${r.farm_verdict.split(':')[0]}. ${r.why}`).join('\n');
+const quarantineLines = radar.quarantined.map((q) => `  ${q.name} (${q.slug}): ${q.reason}`).join('\n');
+const failed = radar.integrity.filter((c) => c.pass === false);
 
 process.stdout.write(
   `token radar: ${calibrationSummary(radar)}\n` +
     `token radar: ${coverageSummary(radar)}\n` +
-    `token radar: watchlist coverage ${onBoard}/${snapshot.watchlist.length}; verdicts ${Object.entries(verdicts).map(([k, v]) => `${k} ${v}`).join(', ')}; reconciliation ${radar.recon.rows} rows, sum ${usd(radar.recon.sum_implied_usd)}, build ${radar.recon.build}\n` +
+    `token radar: watchlist coverage ${onBoard}/${snapshot.watchlist.length}; verdicts, original rows ${tally(board.filter((r) => !promotedSlugs.has(r.slug)))}; promoted rows ${tally(board.filter((r) => promotedSlugs.has(r.slug)))}; reconciliation ${radar.recon.rows} rows, sum ${usd(radar.recon.sum_implied_usd)}, build ${radar.recon.build}\n` +
+    `token radar: validation ladder, median abs log error (leakage-free refits)\n${ladderTable}\n` +
+    `  leave-one-category-out, ${lad.loco.categories} categories with >= 4 peers (${lad.loco.n} peers): full ${f3(lad.loco.full)}, category-only ${f3(lad.loco.category_only)}, naive ${f3(lad.loco.naive)}\n` +
+    `  ablation under 5-fold, full ${f3(lad.ablation.full)}: ${lad.ablation.terms.map((t) => `without ${t.term} ${f3(t.error)} (${t.delta >= 0 ? '+' : ''}${f3(t.delta)})`).join(', ')}\n` +
+    `  band coverage, walk-forward: 50% band ${(radar.fit.band.coverage * 100).toFixed(1)}% (${radar.fit.band.inside}/${radar.fit.band.n}); 80% band ${(radar.fit.band80.coverage * 100).toFixed(1)}% (${radar.fit.band80.inside}/${radar.fit.band80.n})\n` +
+    `  ${lad.note}\n` +
+    `token radar: set-aside audit, ${radar.promoted_size} promoted, ${radar.quarantined.length} quarantined\n${promotedLines}${quarantineLines === '' ? '' : `\n${quarantineLines}`}\n` +
     `token radar: top 5\n  ${top5}\n` +
     `token radar: dashboard source ${dashBytes} bytes, dossier ${Buffer.byteLength(dossier)} bytes with ${shots.length} screenshots\n` +
-    `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
+    `token radar: integrity\n${radar.integrity.map((c) => `  [${c.pass === null ? 'info' : c.pass ? 'pass' : 'FAIL'}] ${c.label}: ${c.value}`).join('\n')}\n` +
+    (failed.length > 0 ? `token radar: INTEGRITY FAILED: ${failed.map((c) => c.label).join(', ')}\n` : `token radar: all ${radar.integrity.filter((c) => c.pass !== null).length} integrity checks pass\n`) +
+    `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.promoted_size} promoted, ${radar.live_size} live set aside)\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
