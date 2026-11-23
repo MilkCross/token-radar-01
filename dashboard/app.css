@@ -105,3 +105,17 @@ ol.plan li::before { content: counter(s); font: 600 14px var(--mono); color: var
 .note { margin: 0 0 16px; color: var(--dim); }
 .mt { margin-top: 16px; }
 @media (max-width: 720px) { .wrap { padding: 16px; } .count { margin-left: 0; } }
+
+.strip { margin-bottom: 16px; }
+.kpis { display: flex; flex-wrap: wrap; gap: 8px; }
+.kpi { background: var(--panel); border: 1px solid var(--line); border-top: 2px solid var(--amber); padding: 8px 16px; flex: 1 1 140px; }
+.kpi b { display: block; font: 600 18px var(--mono); }
+.kpi span { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.08em; }
+.cov { margin: 8px 0; padding: 8px 16px; border-left: 3px solid var(--up); background: var(--panel); color: var(--dim); font: 12px/1.5 var(--mono); }
+details { margin-top: 8px; }
+summary { cursor: pointer; color: var(--amber); font-weight: 600; padding: 4px 0; }
+details .grid { margin-top: 8px; }
+.verdict { padding: 8px 16px; border-left: 3px solid var(--dim); background: var(--panel2); font: 13px/1.5 var(--mono); }
+.verdict.up { border-color: var(--up); } .verdict.down { border-color: var(--down); } .verdict.amber { border-color: var(--amber); }
+.mb { margin-bottom: 16px; }
+.card .tablebox { margin-bottom: 8px; }
