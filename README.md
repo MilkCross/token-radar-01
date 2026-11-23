@@ -8,9 +8,14 @@ An entry for make.fun's [“Build the best token launch radar”](https://make.f
 
 ## What it does
 
-Reads a sealed DefiLlama snapshot (758 protocols, as of 2026-11-14) and ranks 178 pre-token protocols by implied token value. The valuation model (radar-2) is calibrated from the snapshot itself: each protocol is priced at TVL × its category's peer mcap/TVL multiple (peers = protocols in the same category that already have a token with mcap > 0; multiples are shrunk toward the global median and capped at the peer distribution's 90th percentile), adjusted for size, dampened 7-day growth, years live without a token, and chain breadth. No protocol names are hardcoded. Every board row carries a concrete farm plan with step-by-step actions, cost and time estimates, and risk notes.
+Reads a sealed DefiLlama snapshot (758 protocols, as of 2026-11-14) and ranks 178 pre-token protocols by implied token value. The model (radar-4) is calibrated from the snapshot itself; no protocol names are hardcoded.
 
-The dashboard is a dark, sortable and filterable radar board with a per-protocol detail view (model breakdown and farm plan), a comparables view, and a live view.
+- **Valuation.** Each protocol is priced at TVL × its category's peer mcap/TVL multiple (peers are same-category protocols that already have a token; multiples are shrunk toward the global median and capped at the peer 90th percentile). Size, growth, maturity and chain adjustments are fitted by Huber regression on 128 tokenized peers, not hand-set.
+- **Out-of-sample validation.** Median absolute log error, fitted vs category-multiple only: 5-fold cross-validation 1.20 vs 1.51; walk-forward by listed date 1.27 vs 1.57.
+- **Value ranges.** Each row carries a P25–P75 range built from out-of-fold residuals. Measured walk-forward coverage of that range is 51%.
+- **Launch odds.** A regularized logistic regression gives a launch propensity from the peers' record (Brier 0.224 vs 0.249 for the base rate). It is a propensity, not a prediction that a protocol will issue a token.
+- **Farm plans.** Every row has a step-by-step plan that names the protocol's actual chains and costs them from a stated chain-tier table (an assumption of the model, not a measurement). Wallet dilution and deposits scale with TVL. Each plan ends in a worth-it, marginal or skip verdict.
+- **Dashboard.** A dark, sortable, filterable board. The detail view shows a valuation waterfall and the nearest tokenized peers. The Model tab shows a calibration scatter. A reconciliation strip shows the row count, the sum of implied values and a build hash. Comparables and live-token views are also included.
 
 ## Run
 
@@ -23,7 +28,7 @@ Requires Node.js 22+. The program is `main.ts` (standard library only, no networ
 ## Layout
 
 - `main.ts` — entrypoint
-- `lib/model.ts` — valuation model and farm-plan generation
+- `lib/model.ts` — valuation model, validation, launch odds and farm-plan generation
 - `dashboard/` — the radar dashboard (index.html, app.css, app.js)
 - `screenshots/` — dashboard screenshots
 - `vendor/makefun-board.ts` — board/dossier builder (upstream, unmodified)

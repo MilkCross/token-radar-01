@@ -70,6 +70,7 @@ function copyFiles(from: string, to: string): string[] {
 }
 
 const dashFiles = copyFiles(join(here, 'dashboard'), join(out, 'dashboard'));
+const dashBytes = dashFiles.reduce((n, f) => n + statSync(join(out, 'dashboard', f)).size, 0);
 const shots = copyFiles(join(here, 'screenshots'), join(out, 'screenshots'));
 if (shots.length < 3 || shots.length > SCREENSHOT_CAPS.max) {
   process.stderr.write(`token radar: screenshots/ holds ${shots.length} image${shots.length === 1 ? '' : 's'} (the gate takes 3 to ${SCREENSHOT_CAPS.max}): hand in 3 or 4, the board, a detail view, a filtered view and optionally one more\n`);
@@ -83,11 +84,26 @@ for (const name of shots) {
 }
 
 // The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
-writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
+const dossier = buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } });
+writeFileSync(join(out, 'dossier.json'), dossier);
+
+// The self-check a run prints: watchlist coverage, top rows with odds and bands, verdict counts, sizes.
+const slugs = new Set(board.map((r) => r.slug));
+const onBoard = snapshot.watchlist.filter((w) => slugs.has(w)).length;
+const verdicts: Record<string, number> = {};
+for (const r of board) {
+  const label = r.farm_verdict.split(':')[0]!;
+  verdicts[label] = (verdicts[label] ?? 0) + 1;
+}
+const usd = (n: number): string => `$${n.toLocaleString('en-US')}`;
+const top5 = radar.rows.slice(0, 5).map((r) => `#${r.rank} ${r.name} ${usd(r.implied_value_usd)}, odds ${Math.round(r.launch_odds * 100)}%, band ${usd(r.value_low)} to ${usd(r.value_high)}`).join('\n  ');
 
 process.stdout.write(
   `token radar: ${calibrationSummary(radar)}\n` +
     `token radar: ${coverageSummary(radar)}\n` +
+    `token radar: watchlist coverage ${onBoard}/${snapshot.watchlist.length}; verdicts ${Object.entries(verdicts).map(([k, v]) => `${k} ${v}`).join(', ')}; reconciliation ${radar.recon.rows} rows, sum ${usd(radar.recon.sum_implied_usd)}, build ${radar.recon.build}\n` +
+    `token radar: top 5\n  ${top5}\n` +
+    `token radar: dashboard source ${dashBytes} bytes, dossier ${Buffer.byteLength(dossier)} bytes with ${shots.length} screenshots\n` +
     `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
