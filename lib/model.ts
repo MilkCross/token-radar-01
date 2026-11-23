@@ -1,4 +1,4 @@
-// The token radar's model (radar-4): one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model (radar-5): one snapshot of the protocol universe in, one ranked board out.
 //
 // A protocol is pre-token when its index entry records no token (no market cap, no CoinGecko id, no
 // symbol). Implied value is calibrated on the snapshot's own token-bearing protocols (the peers):
@@ -88,9 +88,9 @@ export const MODEL: ModelConstants = {
   chain_cap: 7,
 };
 
-export const MODEL_VERSION = 'radar-4';
+export const MODEL_VERSION = 'radar-5';
 
-/** radar-4 fixed choices: the dashboard states them. */
+/** radar-5 fixed choices: the dashboard states them. */
 export const FIT = {
   thin_peers: 3,
   confidence_k: 8,
@@ -114,7 +114,10 @@ export const FIT = {
   airdrop_pool_share: 0.05,
   hour_value_usd: 15,
   worth_ratio: 3,
+  worth_p25_floor: 1,
   marginal_ratio: 1,
+  capital_apr: 0.045,
+  hold_weeks_fallback: 8,
 };
 
 /** Early rows carried below the watchlist floor, by implied value. */
@@ -182,6 +185,18 @@ export interface PlanFigures {
   ev_wallet_usd: number;
   chains: { name: string; tier: string; cost_usd: number }[];
   chain_cost_usd: number;
+  /** The plan's own hold in days (the hold step) and the weeks the opportunity term uses. */
+  hold_days: number;
+  hold_weeks: number;
+  /** Capital opportunity: deposit x APR x hold_weeks / 52. */
+  opportunity_usd: number;
+  /** All-in cost: fees + hours x hourly value + opportunity. */
+  all_in_usd: number;
+  /** P25 expected value per wallet: value_low x odds x pool share / participants. */
+  ev_p25_wallet_usd: number;
+  /** Point EV over all-in cost, and P25 EV over all-in cost. */
+  ev_ratio: number;
+  ev_p25_ratio: number;
 }
 
 /** One tokenized peer of the same category, nearest in TVL. */
@@ -190,6 +205,8 @@ export interface NearPeer {
   tvl_usd: number;
   mcap_usd: number;
   multiple: number;
+  /** True when the peer is of another category: context only, it did not enter the value. */
+  cross?: boolean;
 }
 
 /** The dashboard's view of one row: the board row plus the farm plan split into its parts. */
@@ -277,7 +294,10 @@ export interface FarmAssumptions {
   airdrop_pool_share: number;
   hour_value_usd: number;
   worth_ratio: number;
+  worth_p25_floor: number;
   marginal_ratio: number;
+  capital_apr: number;
+  hold_weeks_fallback: number;
   tiers: { tier: string; label: string; cost_usd: number }[];
   dilution: typeof DILUTION;
   deposit: typeof DEPOSIT;
@@ -854,15 +874,24 @@ export function depositFor(tvl: number): number {
 
 const usd = (n: number): string => (n >= 10 ? `$${Math.round(n).toLocaleString('en-US')}` : `$${n.toFixed(2)}`);
 
-/** Farm totals and the costed verdict for one row: expected airdrop per wallet against the all-in cost. */
-export function farmVerdict(steps: FarmStep[], ev: number, riskAdjusted: number, participants: number): { cost: number; hours: number; verdict: string } {
+/**
+ * Farm totals and the costed verdict for one row. All-in cost = fees + hours x $15 + capital opportunity
+ * (deposit x 4.5% APR x hold weeks / 52; the hold is the plan's own, or 8 weeks if it has none).
+ * Worth it: point EV >= 3x all-in AND P25 EV >= 1x all-in. Marginal: point EV >= 1x all-in but not Worth it. Skip: point EV < 1x all-in.
+ */
+export function farmVerdict(
+  steps: FarmStep[], ev: number, riskAdjusted: number, participants: number, deposit: number, holdDays: number | null, evP25: number,
+): { cost: number; hours: number; verdict: string; hold_weeks: number; opportunity: number; all_in: number; ratio: number; ratio_p25: number } {
   const cost = Math.round(steps.reduce((s, x) => s + x.cost_usd, 0) * 100) / 100;
   const hours = Math.round(steps.reduce((s, x) => s + x.hours, 0) * 100) / 100;
-  const allIn = cost + hours * FIT.hour_value_usd;
+  const holdWeeks = holdDays === null ? FIT.hold_weeks_fallback : holdDays / 7;
+  const opportunity = deposit * FIT.capital_apr * (holdWeeks / 52);
+  const allIn = cost + hours * FIT.hour_value_usd + opportunity;
   const ratio = ev / allIn;
-  const label = ratio >= FIT.worth_ratio ? 'Worth it' : ratio >= FIT.marginal_ratio ? 'Marginal' : 'Skip';
-  const verdict = `${label}: expected ${usd(ev)} a wallet (risk-adjusted ${usd(riskAdjusted)} x ${FIT.airdrop_pool_share * 100}% pool / ${participants.toLocaleString('en-US')} wallets) vs all-in ${usd(allIn)} (${usd(cost)} fees + ${hours.toFixed(1)}h x $${FIT.hour_value_usd}), ${ratio.toFixed(2)}x.`;
-  return { cost, hours, verdict };
+  const ratioP25 = evP25 / allIn;
+  const label = ratio >= FIT.worth_ratio && ratioP25 >= FIT.worth_p25_floor ? 'Worth it' : ratio >= FIT.marginal_ratio ? 'Marginal' : 'Skip';
+  const verdict = `${label}: point EV ${usd(ev)} a wallet (risk-adjusted ${usd(riskAdjusted)} x ${FIT.airdrop_pool_share * 100}% pool / ${participants.toLocaleString('en-US')} wallets), P25 EV ${usd(evP25)}, vs all-in ${usd(allIn)} (${usd(cost)} fees + ${hours.toFixed(1)}h x $${FIT.hour_value_usd} + ${usd(opportunity)} opportunity on $${deposit.toLocaleString('en-US')} for ${holdWeeks.toFixed(1)} weeks at ${(FIT.capital_apr * 100).toFixed(1)}%): EV/cost ${ratio.toFixed(2)}x point, ${ratioP25.toFixed(2)}x P25.`;
+  return { cost, hours, verdict, hold_weeks: holdWeeks, opportunity, all_in: allIn, ratio, ratio_p25: ratioP25 };
 }
 
 /** FNV-1a (32-bit) of a string's UTF-8 bytes, as 8 hex digits. */
@@ -875,16 +904,20 @@ export function fnv1a(text: string): string {
 /** What the dashboard shows beside a board row and the board itself does not carry. */
 export type RowExtras = Pick<RadarRow, 'value_low' | 'value_high' | 'cat_share' | 'clamp_adj' | 'waterfall' | 'nearest' | 'plan'>;
 
-/** Up to 3 tokenized peers of the same category, nearest in TVL (|ln of the ratio|), ties by slug. */
+/**
+ * Up to 3 tokenized peers of the same category, nearest in TVL (|ln of the ratio|), ties by slug. When fewer than 3
+ * are in the category, the closest tokenized peers of any other category follow, tagged `cross`: display only.
+ */
 export function nearestPeers(p: SnapshotProtocol, peers: SnapshotProtocol[]): NearPeer[] {
   const key = catKey(p.category);
   const lt = Math.log(Math.max(p.tvl_usd, 1));
-  return peers
-    .filter((q) => catKey(q.category) === key)
-    .map((q) => ({ q, d: Math.abs(Math.log(q.tvl_usd) - lt) }))
-    .sort((a, b) => a.d - b.d || cmp(a.q.slug, b.q.slug))
-    .slice(0, 3)
-    .map(({ q }) => ({ name: q.name, tvl_usd: q.tvl_usd, mcap_usd: q.mcap_usd!, multiple: round4(q.mcap_usd! / q.tvl_usd) }));
+  const ranked = peers.map((q) => ({ q, d: Math.abs(Math.log(q.tvl_usd) - lt), same: catKey(q.category) === key }));
+  const view = ({ q }: { q: SnapshotProtocol }) => ({ name: q.name, tvl_usd: q.tvl_usd, mcap_usd: q.mcap_usd!, multiple: round4(q.mcap_usd! / q.tvl_usd) });
+  const byDistance = (a: { q: SnapshotProtocol; d: number }, b: { q: SnapshotProtocol; d: number }) => a.d - b.d || cmp(a.q.slug, b.q.slug);
+  const same = ranked.filter((x) => x.same).sort(byDistance).slice(0, 3).map(view);
+  if (same.length >= 3) return same;
+  const cross = ranked.filter((x) => !x.same).sort(byDistance).slice(0, 3 - same.length).map((x) => ({ ...view(x), cross: true }));
+  return [...same, ...cross];
 }
 
 /** The board and, per slug, the extras only the dashboard shows. `validation` and `prop` are the fits to score with. */
@@ -916,7 +949,9 @@ function scoreBoard(snapshot: Snapshot, model: ModelConstants, validation: FitRe
     const risk = Math.round(s.implied * launch);
     const plan = farmPlan(s.p, s.breakdown.age_days);
     const ev = (s.implied * launch * FIT.airdrop_pool_share) / plan.participants;
-    const fv = farmVerdict(plan.steps, ev, risk, plan.participants);
+    const valueLow = Math.max(1, Math.min(s.implied, Math.round(s.implied * Math.exp(validation.band.q25))));
+    const evP25 = (valueLow * launch * FIT.airdrop_pool_share) / plan.participants;
+    const fv = farmVerdict(plan.steps, ev, risk, plan.participants, plan.deposit, plan.hold_days, evP25);
     const m = s.breakdown;
     let v = s.base;
     const wf: [string, number | null, number][] = [['Base value: TVL x peer multiple', null, Math.round(v)]];
@@ -927,13 +962,26 @@ function scoreBoard(snapshot: Snapshot, model: ModelConstants, validation: FitRe
     }
     wf.push(['Implied value', null, s.implied]);
     extras.set(s.p.slug, {
-      value_low: Math.max(1, Math.min(s.implied, Math.round(s.implied * Math.exp(validation.band.q25)))),
+      value_low: valueLow,
       value_high: Math.max(s.implied, Math.round(s.implied * Math.exp(validation.band.q75))),
       cat_share: round4(shrunkShare(prop.counts, s.p.category, inScope ? s.p : null)),
       clamp_adj: round4(s.clamp),
       waterfall: wf,
       nearest: nearestPeers(s.p, peers),
-      plan: { participants: plan.participants, deposit_usd: plan.deposit, ev_wallet_usd: Math.round(ev * 100) / 100, chains: plan.chains, chain_cost_usd: plan.chain_cost },
+      plan: {
+        participants: plan.participants,
+        deposit_usd: plan.deposit,
+        ev_wallet_usd: Math.round(ev * 100) / 100,
+        chains: plan.chains,
+        chain_cost_usd: plan.chain_cost,
+        hold_days: plan.hold_days,
+        hold_weeks: Math.round(fv.hold_weeks * 100) / 100,
+        opportunity_usd: Math.round(fv.opportunity * 100) / 100,
+        all_in_usd: Math.round(fv.all_in * 100) / 100,
+        ev_p25_wallet_usd: Math.round(evP25 * 100) / 100,
+        ev_ratio: Math.round(fv.ratio * 100) / 100,
+        ev_p25_ratio: Math.round(fv.ratio_p25 * 100) / 100,
+      },
     });
     return {
       rank: i + 1,
@@ -1068,7 +1116,7 @@ function riskFor(p: SnapshotProtocol): string {
 const joinList = (xs: string[]): string => (xs.length <= 1 ? (xs[0] ?? '') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`);
 
 /** A protocol's farm plan, derived from its own record (category, first chains, TVL, 7d change, age). */
-export function farmPlan(p: SnapshotProtocol, age: number | null): { steps: FarmStep[]; participants: number; deposit: number; chains: PlanFigures['chains']; chain_cost: number } {
+export function farmPlan(p: SnapshotProtocol, age: number | null): { steps: FarmStep[]; participants: number; deposit: number; chains: PlanFigures['chains']; chain_cost: number; hold_days: number } {
   const named = p.chains.slice(0, MAX_PLAN_CHAINS);
   const chains = (named.length > 0 ? named : ['its main chain']).map((name) => {
     const tier = named.length > 0 ? chainTier(name) : 'U';
@@ -1114,7 +1162,7 @@ export function farmPlan(p: SnapshotProtocol, age: number | null): { steps: Farm
     { text: `Check the protocol's own points or rewards page, and claim only from the link that page publishes. Never pay to claim. At ${usd(p.tvl_usd)} TVL this plan assumes about ${participants.toLocaleString('en-US')} wallets share the pool.`, cost: 'no fee to check', time: '10 minutes', cost_usd: 0, hours: 10 / 60 },
     { text: `${riskFor(p)} Record the wallet, dates and every transaction in a farm log, then withdraw, unwind and bridge back from ${joinList(chains.map((c) => c.name))}.`, cost: 'bridge-back is in the round-trip figure', time: `${20 + 5 * (n - 1)} minutes`, cost_usd: 0, hours: (20 + 5 * (n - 1)) / 60 },
   ];
-  return { steps, participants, deposit, chains, chain_cost: chainCost };
+  return { steps, participants, deposit, chains, chain_cost: chainCost, hold_days: hold };
 }
 
 /** The live-token protocols, by market cap. */
@@ -1208,7 +1256,10 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
       airdrop_pool_share: FIT.airdrop_pool_share,
       hour_value_usd: FIT.hour_value_usd,
       worth_ratio: FIT.worth_ratio,
+      worth_p25_floor: FIT.worth_p25_floor,
       marginal_ratio: FIT.marginal_ratio,
+      capital_apr: FIT.capital_apr,
+      hold_weeks_fallback: FIT.hold_weeks_fallback,
       tiers: CHAIN_TIERS,
       dilution: DILUTION,
       deposit: DEPOSIT,

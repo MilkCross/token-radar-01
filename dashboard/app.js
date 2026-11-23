@@ -5,7 +5,7 @@
   var root = document.getElementById('app');
   if (!D) { root.textContent = 'No data: data.js did not load.'; return; }
   var rows = D.rows;
-  var S = { q: '', cat: '', chain: '', wl: false, early: false, pos: false, tvl: 0, key: 'rank', dir: 1, sel: rows[0].slug };
+  var S = { q: '', cat: '', chain: '', wl: false, early: false, pos: false, verdict: '', tvl: 0, key: 'rank', dir: 1, sel: rows[0].slug };
   var view = 'board';
   var lnLo = Math.log(Math.min.apply(null, rows.map(function (r) { return r.value_low; })));
   var lnSpan = Math.log(Math.max.apply(null, rows.map(function (r) { return r.value_high; }))) - lnLo;
@@ -21,7 +21,8 @@
   function fmtPct(n) { return n === null || n === undefined ? 'n/a' : (n > 0 ? '+' : '') + n.toFixed(1) + '%'; }
   function fmtAge(d) { return d === null || d === undefined ? 'n/a' : d >= 365 ? (d / 365).toFixed(1) + 'y' : d + 'd'; }
   function fmtX(n) { return 'x' + (n >= 10 ? n.toFixed(1) : n.toFixed(2)); }
-  function why(r) { return fmtX(r.model.peer_multiple) + ' n=' + r.model.peer_count + ' (' + Math.round(r.model.confidence * 100) + '%)'; }
+  function why(r) { return fmtX(r.model.peer_multiple) + ' n=' + r.model.peer_count; }
+  function vlabel(r) { return r.farm_verdict.split(':')[0]; }
   function fmtOdds(o) { return Math.round(o * 100) + '%'; }
   function full(n) { return '$' + n.toLocaleString('en-US'); }
   function range(r) { return fmtUsd(r.value_low) + ' – ' + fmtUsd(r.value_high); }
@@ -70,7 +71,7 @@
   function modelLine() {
     return el('p', { class: 'model-line' },
       el('b', { text: D.model_version + ': ' }),
-      'implied value = TVL × peer mcap/TVL multiple (shrunk toward the global median of ' + fmtX(D.global_median_multiple) + ', from ' + D.peer_total + ' token-bearing peers; blended with the category family under 3 peers, capped at the peer p90 of ' + fmtX(D.peer_cap_multiple) + ') × size, growth, maturity and chain adjustments fitted by Huber regression (each clamped to 0.5–2, and so is their product). Ranges are the peers’ own P25–P75 miss. Odds are a launch propensity fitted on the peers’ record. Every figure comes from the snapshot; the model is a claim, not a prediction.');
+      'implied value = TVL × peer mcap/TVL multiple (shrunk toward the global median of ' + fmtX(D.global_median_multiple) + ', from ' + D.peer_total + ' token-bearing peers; blended with the category family under 3 peers, capped at the peer p90 of ' + fmtX(D.peer_cap_multiple) + ') × size, growth, maturity and chain adjustments fitted by Huber regression (each clamped to 0.5–2, and so is their product). Ranges are the peers’ own P25–P75 miss. Odds are a launch propensity fitted on the peers’ record. Every figure comes from the snapshot. Values are implied circulating market cap, from peers’ circulating mcap/TVL — not FDV; the snapshot has no supply or unlock schedules. Cross-sectional peer benchmark, out-of-fold median abs log error ' + D.fit.error_fitted.toFixed(2) + '; not a price forecast.');
   }
   function tabs() {
     var defs = [['board', 'Board'], ['model', 'Model'], ['comparables', 'Comparables'], ['live', 'Live tokens']];
@@ -132,6 +133,7 @@
       if (S.early && r.watchlist) return false;
       if (S.pos && !(r.change_7d !== null && r.change_7d > 0)) return false;
       if (S.tvl && r.tvl_usd < S.tvl) return false;
+      if (S.verdict && vlabel(r) !== S.verdict) return false;
       return true;
     });
     out.sort(function (a, b) {
@@ -162,14 +164,15 @@
       select('Category', [['', 'All categories']].concat(cats.map(function (c) { return [c, c]; })), S.cat, function (v) { S.cat = v; draw(); }),
       select('Chain', [['', 'All chains']].concat(chains.map(function (c) { return [c, c]; })), S.chain, function (v) { S.chain = v; draw(); }),
       select('Minimum TVL', [[0, 'TVL: any'], [1e7, 'TVL ≥ $10M'], [5e7, 'TVL ≥ $50M'], [1e8, 'TVL ≥ $100M'], [5e8, 'TVL ≥ $500M']], S.tvl, function (v) { S.tvl = +v; draw(); }),
+      select('Verdict', [['', 'All verdicts'], ['Worth it', 'Worth it'], ['Marginal', 'Marginal'], ['Skip', 'Skip']], S.verdict, function (v) { S.verdict = v; draw(); }),
       check('Watchlist only', 'wl'), check('Early only', 'early'), check('Positive 7d only', 'pos'),
       el('span', { class: 'count', id: 'count' }));
     var box = el('div', { class: 'tablebox scroll', id: 'tbox' });
-    var pane = el('section', { id: 'detail', 'aria-live': 'polite' });
+    var pane = el('aside', { id: 'detail', 'aria-live': 'polite', 'aria-label': 'Selected protocol' });
     showDetail(pane);
     boardUpdate = function () { fillTable(box, controls.querySelector('#count'), pane); };
     boardUpdate();
-    return el('div', {}, strip(), controls, box, pane);
+    return el('div', {}, strip(), controls, el('div', { class: 'split' }, el('div', { class: 'left' }, box), pane));
   }
   function showDetail(pane) {
     var r = rows.filter(function (x) { return x.slug === S.sel; })[0] || rows[0];
@@ -197,12 +200,13 @@
         [].forEach.call(box.querySelectorAll('tr.sel'), function (x) { x.className = ''; });
         tr.className = 'sel';
         showDetail(pane);
+        pane.scrollTop = 0;
         try { history.replaceState(null, '', '#/p/' + r.slug); } catch (e) { /* file:// may refuse */ }
       };
       var pos = function (v) { return ((Math.log(v) - lnLo) / lnSpan * 100).toFixed(1) + '%'; };
       tr = el('tr', { tabindex: '0', class: r.slug === S.sel ? 'sel' : '', onclick: open, onkeydown: function (e) { if (e.key === 'Enter') open(); } },
         el('td', { class: 'n dim', text: '#' + r.rank }),
-        el('td', { class: 'name' }, r.name, el('span', { class: 'badge ' + (r.watchlist ? 'wl' : 'early'), text: r.watchlist ? 'Watchlist' : 'Early' })),
+        el('td', { class: 'name' }, r.name, el('span', { class: 'badge ' + (r.watchlist ? 'wl' : 'early'), text: r.watchlist ? 'WL' : 'New', title: r.watchlist ? 'Watchlist' : 'Early row' })),
         el('td', { class: 'cat dim', text: r.category || 'Uncategorized' }),
         el('td', { class: 'n dim', text: String(r.chains.length), title: r.chains.join(', ') }),
         el('td', { class: 'n', text: fmtUsd(r.tvl_usd) }),
@@ -234,10 +238,13 @@
     return card('Valuation waterfall', tbl(['Step', 'Factor', 'Value', ''], data, 1), p('Each factor is the fitted, clamped adjustment; their product is clamped to 0.5–2' + (r.clamp_adj !== 1 ? ' (here it binds: ×' + r.clamp_adj.toFixed(2) + ')' : '') + '. The last row scales the implied value by the peers’ out-of-fold P25 and P75 misses.'));
   }
   function nearest(r) {
-    var n = r.nearest;
+    var n = r.nearest, N = r.model.peer_count, cross = n.some(function (x) { return x.cross; });
     return card('Nearest tokenized peers',
-      n.length ? tbl(['Peer', 'TVL', 'Market cap', 'mcap/TVL'], n.map(function (x) { return [x.name, fmtUsd(x.tvl_usd), fmtUsd(x.mcap_usd), fmtX(x.multiple)]; }), 1) : p('No tokenized peer in this category.'),
-      p('Up to 3 peers of the same category, closest in TVL (smallest |ln of the TVL ratio|). This row: ' + fmtUsd(r.tvl_usd) + ' TVL, ' + fmtX(r.model.peer_multiple) + ' used.'));
+      n.length ? tbl(['Peer', 'TVL', 'Market cap', 'mcap/TVL'], n.map(function (x) {
+        return [x.cross ? [document.createTextNode(x.name), el('span', { class: 'badge live', text: 'cross-category' })] : x.name, fmtUsd(x.tvl_usd), fmtUsd(x.mcap_usd), fmtX(x.multiple)];
+      }), 1) : p('No tokenized peer in this category.'),
+      p('Same-category peers first, closest in TVL (smallest |ln of the TVL ratio|)' + (cross ? ', then the closest peers of any category' : '') + '. This row: ' + fmtUsd(r.tvl_usd) + ' TVL, ' + fmtX(r.model.peer_multiple) + ' used.'),
+      cross ? p('Cross-category rows are context only and did not enter the value; the value used the ' + N + ' same-category peer' + (N === 1 ? '' : 's') + ' with shrinkage.') : null);
   }
   function detail(r) {
     var m = r.model, pl = r.plan, F = D.farm;
@@ -262,7 +269,7 @@
       el('div', { class: 'grid w2' },
         card('Snapshot figures',
           el('dl', { class: 'facts' },
-            fact('Slug', r.slug), fact('TVL', full(r.tvl_usd)), fact('TVL change 7d', fmtPct(r.change_7d)),
+            fact('Slug', r.slug), el('dt', { class: 'wide', text: 'Basis: circulating mcap/TVL (not FDV)' }), fact('TVL', full(r.tvl_usd)), fact('TVL change 7d', fmtPct(r.change_7d)),
             fact('Listed', r.listed_at || 'n/a'), fact('Age', r.age_days === null ? 'n/a (365d assumed)' : r.age_days + ' days'),
             fact('Chains', String(r.chains.length)), fact('Token', 'none recorded'),
             fact('Implied value', full(r.implied_value_usd)), fact('Range (P25–P75)', full(r.value_low) + ' – ' + full(r.value_high)),
@@ -280,7 +287,13 @@
       el('div', { class: 'grid w2 mt' }, waterfall(r), nearest(r)),
       el('section', { class: 'card mt' }, el('h3', { text: 'Farm plan and verdict' }),
         el('p', { class: 'verdict ' + vcls, text: r.farm_verdict }),
-        p('Totals: $' + r.farm_cost_usd.toFixed(2) + ' in fees, ' + r.farm_hours.toFixed(1) + ' hands-on hours. Chains ' + pl.chains.map(function (c) { return c.name + ' (tier ' + c.tier + ', $' + c.cost_usd + ')'; }).join(', ') + ' = $' + pl.chain_cost_usd + ' round trip. Deposit $' + pl.deposit_usd.toLocaleString('en-US') + '; about ' + pl.participants.toLocaleString('en-US') + ' wallets share a ' + (F.airdrop_pool_share * 100) + '% pool, so expected $' + pl.ev_wallet_usd.toFixed(2) + ' a wallet = implied × propensity × ' + (F.airdrop_pool_share * 100) + '% / wallets. Time at $' + F.hour_value_usd + '/h; worth it ≥ ' + F.worth_ratio + 'x, marginal ≥ ' + F.marginal_ratio + 'x.'),
+        el('dl', { class: 'facts mt' },
+          fact('Point EV a wallet', '$' + pl.ev_wallet_usd.toFixed(2)), fact('P25 EV a wallet', '$' + pl.ev_p25_wallet_usd.toFixed(2)),
+          fact('All-in cost', '$' + pl.all_in_usd.toFixed(2)),
+          fact('  fees', '$' + r.farm_cost_usd.toFixed(2)), fact('  hands-on time', r.farm_hours.toFixed(1) + 'h × $' + F.hour_value_usd + ' = $' + (r.farm_hours * F.hour_value_usd).toFixed(2)),
+          fact('  capital opportunity', '$' + pl.deposit_usd.toLocaleString('en-US') + ' × ' + (F.capital_apr * 100).toFixed(1) + '% × ' + pl.hold_weeks.toFixed(1) + '/52 wk = $' + pl.opportunity_usd.toFixed(2)),
+          fact('EV / cost', pl.ev_ratio.toFixed(2) + 'x point, ' + pl.ev_p25_ratio.toFixed(2) + 'x P25')),
+        p('Chains ' + pl.chains.map(function (c) { return c.name + ' (tier ' + c.tier + ', $' + c.cost_usd + ')'; }).join(', ') + ' = $' + pl.chain_cost_usd + ' round trip. About ' + pl.participants.toLocaleString('en-US') + ' wallets share a ' + (F.airdrop_pool_share * 100) + '% pool: EV = implied × propensity × ' + (F.airdrop_pool_share * 100) + '% / wallets; P25 EV uses the P25 value. Worth it: point EV ≥ ' + F.worth_ratio + 'x all-in and P25 EV ≥ ' + F.worth_p25_floor + 'x all-in. Marginal: point EV ≥ ' + F.marginal_ratio + 'x all-in but not Worth it. Skip: point EV < ' + F.marginal_ratio + 'x.'),
         el('ol', { class: 'plan mt' }, steps)));
   }
 
@@ -309,6 +322,7 @@
     var tiers = F.tiers.map(function (t) { return ['Tier ' + t.tier, t.label, '$' + t.cost_usd]; });
     return el('div', {},
       p('Two out-of-sample checks of the same model, side by side. Where the fitted gain is small the table says so.', 'note'),
+      p('Basis: values are implied circulating market cap, from peers’ circulating mcap/TVL (not FDV). The snapshot has no supply or unlock schedules, so no fully diluted value can be derived. These checks measure a cross-sectional peer benchmark, not a price forecast.', 'note'),
       el('div', { class: 'grid mb' },
         valCard('Validation 1: 5-fold cross-validation', f.cv, f.cv.n + ' peers predicted out of fold: each fold is refit (category multiples and Huber fit) on the other four; fold = sum of the slug’s char codes mod ' + f.cv.folds + '.'),
         valCard('Validation 2: walk-forward', w, 'Fit on the earliest ' + w.n_fit + ' peers by listed date, tested on the latest ' + w.n + ' (listed ' + w.from + ' to ' + w.to + '; the ' + w.undated + ' undated peers count as oldest). A smaller, harder test.')),
@@ -330,7 +344,8 @@
             el('p', {}, el('b', { text: 'Wallets sharing the pool. ' }), el('code', { text: 'clamp(round(' + dl.base + ' × (TVL / $' + dl.ref_tvl_usd / 1e6 + 'M)^' + dl.exponent + '), ' + dl.min + ', ' + dl.max.toLocaleString('en-US') + ')' })),
             el('p', {}, el('b', { text: 'Deposit. ' }), el('code', { text: 'clamp(round(TVL × ' + dp.rate + ' / ' + dp.step + ') × ' + dp.step + ', $' + dp.min + ', $' + dp.max.toLocaleString('en-US') + ')' }), ' (returned on exit, not a cost).'),
             el('p', {}, el('b', { text: 'Expected value a wallet. ' }), 'implied × propensity × ' + (F.airdrop_pool_share * 100) + '% pool / wallets. One qualifying action costs ' + (F.action_fee_share * 100) + '% of the first chain’s round trip.'),
-            el('p', {}, el('b', { text: 'Verdict. ' }), 'Expected value over all-in cost (fees + hands-on hours at $' + F.hour_value_usd + '/h): Worth it ≥ ' + F.worth_ratio + 'x, Marginal ≥ ' + F.marginal_ratio + 'x, else Skip.'),
+            el('p', {}, el('b', { text: 'All-in cost. ' }), 'fees + hands-on hours × $' + F.hour_value_usd + '/h + capital opportunity = deposit × ' + (F.capital_apr * 100).toFixed(1) + '% APR × hold weeks / 52. Hold weeks is the plan’s own hold in days / 7 (the hold step: 21 to 60 days by age and TVL momentum); a fixed ' + F.hold_weeks_fallback + ' weeks would apply only to a plan with no hold, and none lacks one.'),
+            el('p', {}, el('b', { text: 'Verdict. ' }), 'P25 EV a wallet = P25 value × propensity × ' + (F.airdrop_pool_share * 100) + '% / wallets. Worth it: point EV ≥ ' + F.worth_ratio + 'x all-in cost and P25 EV ≥ ' + F.worth_p25_floor + 'x all-in cost. Marginal: point EV ≥ ' + F.marginal_ratio + 'x all-in cost but not Worth it. Skip: point EV < ' + F.marginal_ratio + 'x all-in cost. The thresholds are not tuned to a target count.'),
             el('p', {}, el('b', { text: 'Tactics. ' }), '7d TVL above +5%: crowding caution and a hold capped at 21 days; below −5%: accumulate quietly. Listed under a year: early-user footprint; over 4 years: a sustained eight-week cadence.')))));
   }
 
@@ -390,7 +405,7 @@
     var inner = view === 'model' ? modelView() : view === 'comparables' ? comparablesView() : view === 'live' ? liveView() : boardView();
     var keep = view === 'board' && document.activeElement && document.activeElement.type === 'search';
     root.textContent = '';
-    root.appendChild(el('div', { class: 'wrap' }, header(), modelLine(), tabs(), el('main', {}, inner)));
+    root.appendChild(el('div', { class: 'wrap' + (view === 'board' ? ' wide' : '') }, header(), modelLine(), tabs(), el('main', {}, inner)));
     if (keep) { var s = root.querySelector('input[type=search]'); if (s) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); } }
     if (view !== 'board') document.title = 'Token Launch Radar';
   }
