@@ -1,40 +1,42 @@
-// The token radar's model (radar-6): one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model (radar-7): one snapshot of the protocol universe in, one ranked board out.
 //
 // A protocol is pre-token when its index entry records no token (no market cap, no CoinGecko id, no
 // symbol). Implied value is calibrated on the snapshot's own token-bearing protocols (the peers):
 //
+//   curve          = exp(a + b ln(TVL / $100M)), a Huber fit of ln mcap on ln TVL over all peers (one global power law)
 //   ratio          = mcap / tvl, for every protocol with a market cap and TVL above zero
-//   cap            = p90 of all peer ratios (nearest-rank); peerMultiple = min(shrunk, cap)
-//   peerMultiple   = (n x categoryMedian + 8 x globalMedian) / (n + 8)   (n = peers in the category)
-//   implied        = max(1, round(tvl x peerMultiple x baseAdj x sizeAdj x growthAdj x maturityAdj x chainAdj x clamp))
+//   peerMultiple   = (n x categoryMedian + 8 x globalMedian) / (n + 8)   (n = peers in the category; no family blend)
+//   w              = n / (n + k), k = 10: how far a category may pull the value away from the curve
+//   capN           = globalMedian x (p90 / globalMedian)^w: the multiple's ceiling tightens as the category thins
+//   ln category    = ln(tvl x min(peerMultiple, capN)) + size term + clamp(base + growth + maturity + chains, ln 0.5, ln 2)
+//   ln implied     = ln curve + w x (ln category - ln curve); under 5 peers the deviation from the curve is capped at
+//                    the peers' nearest-rank P90 of ln(mcap / curve)
 //
-// The adjustments are fitted, not hand-set. A Huber IRLS regression over the peers explains
-// log(mcap / (tvl x categoryMultiple)) from [ln tvl, clamped 7d change, ln age in years, ln chains]: start from
-// OLS, then exactly 25 reweighted least-squares passes with Huber weights (delta = 1.345 x MAD of the residuals,
-// recomputed each pass; a MAD of 0 stops early). Each factor is exp(coefficient x (feature - peer mean)),
-// clamped to [0.5, 2]; baseAdj is exp(intercept); the combined adjustment is clamped to [0.5, 2] as well
-// (`clamp` is the factor that does it, 1 unless it binds). A degenerate fit falls back to the radar-2 constants.
+// The size, growth, maturity and chain terms are fitted, not hand-set: a Huber IRLS regression over the peers
+// explains ln(mcap / (tvl x min(peerMultiple, p90))) from [ln tvl, clamped 7d change, ln age in years, ln chains]
+// (OLS start, exactly 25 reweighted passes, delta = 1.345 x MAD of the residuals, recomputed each pass; a MAD of
+// 0 stops early). Each term is coef x (feature - peer mean). The size term is free (a power law's exponent); the
+// product of the other terms is clamped to [0.5, 2]. A degenerate fit leaves the terms at zero.
 //
-// Validation, both out of sample: 5-fold CV (fold = sum of the slug's char codes % 5; each fold is predicted by
-// a model refit on the other four) and walk-forward (fit on the earliest 60% by listed date, test on the latest
-// 40%; peers with no listed date count as oldest). Both report the median absolute log error of the fitted
-// model and of the category multiple alone. Bands: the empirical P25/P75 of the 5-fold out-of-fold residuals
-// log(actual / predicted) scale every row's implied value into [low, high]; their coverage is measured on the
-// walk-forward test peers.
+// Validation, both out of sample and every refit inside its own training part, k chosen by an inner leave-one-out:
+// leave-one-out, and an age-cohort walk-forward (fit on the earliest 60% by listed date, test on the latest 40%;
+// peers with no listed date count as oldest). Bands: the empirical P25/P75 and P10/P90 of the 5-fold out-of-fold
+// residuals log(actual / predicted) (fold = sum of the slug's char codes % 5) scale every row's value into
+// [low, high]; their coverage is measured on the walk-forward test peers with bands built from its training part
+// alone. The ladder compares naive, category-only, the power law alone, radar-6 (the previous model) and this one.
+//
+// Thin rule: a category with fewer than 3 peers marks its rows THIN, and a THIN row's verdict is capped at Marginal.
 //
 // Launch propensity: a logistic regression (L2 lambda 1 on non-intercept weights, Newton, exactly 50 iterations
 // from zero) of "records a token" on the protocols in scope (the snapshot less the product types the board
 // excludes), from the category's shrunk tokenized share (leave-one-out), ln TVL (z-scored), ln chains and ln age.
 // Scored on a slug-parity split by Brier score against the base rate. It describes the record; it is no forecast.
+// The share's smoothing constant is tested on that same split each build: the larger constant is used only if
+// its held-half Brier stays within 0.005 of the previous constant's.
 //
-// A category with fewer than 3 peers blends in its family's multiple (weight (3 - n) / 3).
-//
-// radar-6 adds proof and presentation only; the point estimates of radar-5 are unchanged. A validation ladder
-// (naive / category-only / full, under 5-fold, repeated 10-fold, leave-one-out and walk-forward, plus
-// leave-one-category-out, a per-term ablation and an 80% band) refits the multiples, the shrinkage and the Huber
-// fit inside every training part. The 20 pre-token protocols radar-5 set aside are audited one by one: those with
-// a TVL at the floor and a chain are valued by the same pipeline, tagged low confidence and shown with the 80%
-// band; the rest are quarantined with a reason. An integrity array of computed checks ships with the data.
+// The 20 pre-token protocols a first pass sets aside are audited one by one: those with a TVL at the floor and a
+// chain are valued by the same pipeline, tagged low confidence and shown with the 80% band; the rest are
+// quarantined with a reason. An integrity array of computed checks ships with the data.
 //
 // No protocol name is ever special-cased: the same function scores every row.
 
@@ -98,9 +100,9 @@ export const MODEL: ModelConstants = {
   chain_cap: 7,
 };
 
-export const MODEL_VERSION = 'radar-6';
+export const MODEL_VERSION = 'radar-7';
 
-/** radar-5 fixed choices: the dashboard states them. */
+/** Fixed choices: the dashboard states them. */
 export const FIT = {
   thin_peers: 3,
   confidence_k: 8,
@@ -112,10 +114,14 @@ export const FIT = {
   huber_iters: 25,
   huber_k: 1.345,
   cv_folds: 5,
-  cv10_folds: 10,
-  cv10_repeats: 3,
-  loco_min_peers: 4,
   walk_train_share: 0.6,
+  hybrid_k: 10,
+  hybrid_k_grid: [5, 6, 7, 8, 9, 10],
+  hybrid_cap_n: 5,
+  hybrid_cap_q: 0.9,
+  ladder_noise: 0.01,
+  size_scale_usd: 100_000_000,
+  thin_verdict_cap: 'Marginal',
   band_lo: 0.25,
   band_hi: 0.75,
   band80_lo: 0.1,
@@ -124,6 +130,8 @@ export const FIT = {
   logit_lambda: 1,
   logit_ridge: 1e-9,
   odds_smoothing: 4,
+  odds_smoothing_variant: 8,
+  odds_brier_tolerance: 0.005,
   odds_min: 0.02,
   odds_max: 0.95,
   airdrop_pool_share: 0.05,
@@ -152,7 +160,7 @@ export interface FarmStep {
   hours: number;
 }
 
-/** The model's workings for one row. */
+/** The model's workings for one row. `size_adj` to `base_adj` are the fitted terms as factors, before the blend with the curve; `confidence` is the blend weight w = n / (n + k). */
 export interface ModelBreakdown {
   peer_multiple: number;
   peer_count: number;
@@ -272,7 +280,11 @@ export interface RadarRow {
   cat_share: number;
   /** Combined-adjustment clamp factor, 1 unless the [0.5, 2] clamp binds. */
   clamp_adj: number;
-  /** Valuation waterfall: [label, factor, running value]; the base value comes first, the implied value last. */
+  /** True when the category has fewer than 3 peers: the verdict is capped at Marginal. */
+  thin: boolean;
+  /** True when the cap changed the verdict (it would have been Worth it). */
+  verdict_capped: boolean;
+  /** Valuation waterfall: [label, factor, running value]; the curve's value comes first, the implied value last. */
   waterfall: [string, number | null, number][];
   nearest: NearPeer[];
   plan: PlanFigures;
@@ -294,7 +306,7 @@ export interface PeerRow {
   category: string;
   n: number;
   median_multiple: number;
-  /** The multiple the model uses: shrunk, thin-blended, capped. */
+  /** The multiple the model uses at full weight: shrunk toward the global median. */
   multiple: number;
 }
 
@@ -357,6 +369,18 @@ export interface OddsReport {
   n_test: number;
   brier_propensity: number;
   brier_base: number;
+  /** The build's test of a larger smoothing constant on the same held half. */
+  experiment: OddsExperiment;
+}
+
+/** The in-fit odds test: Brier of the held half under the current and the larger smoothing constant. */
+export interface OddsExperiment {
+  current: number;
+  variant: number;
+  brier_current: number;
+  brier_variant: number;
+  tolerance: number;
+  adopted: boolean;
 }
 
 /** Out-of-sample errors of the fitted model and of the category multiple alone. */
@@ -366,50 +390,68 @@ export interface ErrorPair {
   baseline: number;
 }
 
+/** A band: the out-of-fold residual's quantiles that scale every row (lo, hi), and the coverage on the walk-forward test of the band its training part alone builds (test_lo, test_hi). */
+export interface BandReport {
+  lo: number;
+  hi: number;
+  test_lo: number;
+  test_hi: number;
+  coverage: number;
+  inside: number;
+  n: number;
+}
+
 /** The fit and its validation, as the dashboard shows them. */
 export interface FitReport {
   fit_method: string;
   features: string[];
   coefficients: number[];
   means: number[];
+  /** The power law: [intercept, slope on ln(TVL / $100M)]. */
+  curve: number[];
+  /** The blend constant k in use, the k a leave-one-out over all peers picks, and its grid scores. */
+  k: number;
+  k_loo: number;
+  k_grid: [number, number][];
+  /** Nearest-rank P90 of ln(mcap / curve): the cap on a thin category's pull away from the curve. */
+  residual_cap: number;
   fallback: boolean;
   peers_fit_all: number;
-  /** Median absolute log error out of fold (5-fold CV): fitted vs category multiple alone. */
-  error_fitted: number;
-  error_median_only: number;
-  cv: ErrorPair & { folds: number };
+  /** Median abs log error of the shipped model (k tuned inside every fold) and of the category multiple alone, per scheme. */
+  loo: ErrorPair;
   walk: ErrorPair & { n_fit: number; from: string; to: string; undated: number };
-  /** Empirical quantiles of the out-of-fold residual ln(actual / predicted), and the walk-forward coverage of the band they make. */
-  band: { q25: number; q75: number; coverage: number; inside: number; n: number };
-  /** The 80% band: empirical P10/P90 of the same out-of-fold residual, with its walk-forward coverage measured the same way. */
-  band80: { q10: number; q90: number; coverage: number; inside: number; n: number };
-  /** The validation ladder: three variants under four schemes, leave-one-category-out, and the per-term ablation. */
+  /** Sum of predicted over sum of actual market cap on the held-out peers, per scheme. */
+  level: { loo: number; walk: number };
+  /** The 50% band (P25/P75) and the 80% band (P10/P90), as ln-residual offsets. */
+  band: BandReport;
+  band80: BandReport;
   ladder: Ladder;
-  /** Out-of-fold [log10 predicted, log10 actual] for every peer. */
+  /** Per factor: [label, leave-one-out change in error when it is removed, walk-forward change]; null where no ablation applies. */
+  factors: [string, number | null, number | null][];
+  /** Leave-one-out [log10 predicted, log10 actual] for every peer. */
   scatter: [number, number][];
 }
 
-/** One ladder row: median abs log error of a variant under each scheme, and its ratios to naive and to category-only. */
+/** One ladder row: median abs log error under each scheme, its ratio to naive, and the held-out level (sum predicted / sum actual). */
 export interface LadderRow {
-  id: 'naive' | 'category' | 'full';
+  id: string;
   label: string;
-  /** [5-fold, repeated 10-fold, leave-one-out, walk-forward] */
+  /** [leave-one-out, walk-forward] */
   errors: number[];
   vs_naive: number[];
-  vs_category: number[];
+  level: number[];
 }
 
-/** The validation ladder, every number computed with leakage-free refits. */
+/** The ladder: five variants under two schemes, then the shipped model's terms removed one at a time (and a noise column that must not help). */
 export interface Ladder {
   schemes: string[];
   /** Predictions behind each scheme's median. */
   n: number[];
   rows: LadderRow[];
-  repeats: number;
-  folds10: number;
-  loco: { categories: number; n: number; naive: number; category_only: number; full: number; by_category: { category: string; n: number; naive: number; category_only: number; full: number }[] };
-  ablation: { full: number; terms: { term: string; error: number; delta: number }[] };
-  summary: string;
+  /** Terms of the shipped model at k = 10: [term, error LOO, error walk-forward, change LOO, change walk-forward, disposition]. */
+  terms: [string, number, number, number, number, string][];
+  /** The reference the term changes are measured against: the shipped model at the fixed k. */
+  reference: number[];
   /** One honest line on constants chosen with the full peer set in view. */
   note: string;
 }
@@ -619,33 +661,63 @@ function solveAugmented(A: number[][]): number[] | null {
   return x.every((v) => Number.isFinite(v)) ? x : null;
 }
 
+/** Median of a typed array, on a copy (0 when empty). */
+function medianOf(xs: Float64Array): number {
+  if (xs.length === 0) return 0;
+  const s = Float64Array.from(xs).sort();
+  const m = s.length >> 1;
+  return s.length % 2 === 1 ? s[m]! : (s[m - 1]! + s[m]!) / 2;
+}
+
+/** The normal equations X'WX b = X'Wy as a k x (k+1) system, into `A` (a buffer the caller reuses). */
+function normalEquations(A: Float64Array[], X: number[][], y: number[], w: Float64Array | null): void {
+  const k = A.length;
+  for (const row of A) row.fill(0);
+  for (let r = 0; r < X.length; r++) {
+    const x = X[r]!;
+    const wr = w === null ? 1 : w[r]!;
+    for (let i = 0; i < k; i++) {
+      const wi = wr * x[i]!;
+      const row = A[i]!;
+      for (let j = 0; j < k; j++) row[j]! += wi * x[j]!;
+      row[k]! += wi * y[r]!;
+    }
+  }
+}
+
 /** (Weighted) least squares by the normal equations; null when the system is singular or not finite. */
 export function ols(X: number[][], y: number[], w?: number[]): number[] | null {
   const k = X[0]?.length ?? 0;
   if (k === 0 || X.length <= k) return null;
-  const A: number[][] = Array.from({ length: k }, () => new Array<number>(k + 1).fill(0));
-  for (let r = 0; r < X.length; r++) {
-    const row = X[r]!;
-    const wr = w === undefined ? 1 : w[r]!;
-    for (let i = 0; i < k; i++) {
-      for (let j = 0; j < k; j++) A[i]![j]! += wr * row[i]! * row[j]!;
-      A[i]![k]! += wr * row[i]! * y[r]!;
-    }
-  }
-  return solveAugmented(A);
+  const A = Array.from({ length: k }, () => new Float64Array(k + 1));
+  normalEquations(A, X, y, w === undefined ? null : Float64Array.from(w));
+  return solveAugmented(A as unknown as number[][]);
 }
 
 /** Huber IRLS: the OLS start, then exactly 25 weighted passes (delta = 1.345 x MAD of the residuals each pass; MAD 0 stops). */
 export function huber(X: number[][], y: number[]): number[] | null {
-  let beta = ols(X, y);
+  const n = X.length;
+  const k = X[0]?.length ?? 0;
+  if (k === 0 || n <= k) return null;
+  const A = Array.from({ length: k }, () => new Float64Array(k + 1));
+  const solve = (w: Float64Array | null): number[] | null => {
+    normalEquations(A, X, y, w);
+    return solveAugmented(A as unknown as number[][]);
+  };
+  let beta = solve(null);
   if (beta === null) return null;
+  const r = new Float64Array(n);
+  const dev = new Float64Array(n);
+  const w = new Float64Array(n);
   for (let it = 0; it < FIT.huber_iters; it++) {
-    const r = y.map((v, i) => v - X[i]!.reduce((s, x, j) => s + x * beta![j]!, 0));
-    const m = median(r);
-    const mad = median(r.map((v) => Math.abs(v - m)));
+    for (let i = 0; i < n; i++) r[i] = y[i]! - X[i]!.reduce((s, x, j) => s + x * beta![j]!, 0);
+    const m = medianOf(r);
+    for (let i = 0; i < n; i++) dev[i] = Math.abs(r[i]! - m);
+    const mad = medianOf(dev);
     if (mad === 0) break;
     const delta = FIT.huber_k * mad;
-    const next = ols(X, y, r.map((v) => (Math.abs(v) <= delta ? 1 : delta / Math.abs(v))));
+    for (let i = 0; i < n; i++) w[i] = Math.abs(r[i]!) <= delta ? 1 : delta / Math.abs(r[i]!);
+    const next = solve(w);
     if (next === null) break;
     beta = next;
   }
@@ -695,12 +767,9 @@ function adjustments(p: SnapshotProtocol, asOf: string, comps: Comparables, mode
   return { ...parts, clamp: total / product, total, age };
 }
 
-/** The comparables the model calibrates on, with the adjustments fitted on all peers. */
-export function comparables(snapshot: Snapshot, model: ModelConstants = MODEL): Comparables {
-  const peers = snapshot.protocols.filter(isPeer);
-  const comps = baseComparables(peers, snapshot.protocols);
-  comps.fit = fitPeers(peers, snapshot.as_of, comps, model);
-  return comps;
+/** The comparables the model calibrates on (the multiples, the cap and the growth medians; the terms are fitted by fitHybrid). */
+export function comparables(snapshot: Snapshot): Comparables {
+  return baseComparables(snapshot.protocols.filter(isPeer), snapshot.protocols);
 }
 
 /** Empirical quantile with linear interpolation (0 when empty). */
@@ -720,161 +789,272 @@ const charSum = (t: string): number => {
   return n;
 };
 
-/** One out-of-sample prediction: the actual mcap, the category multiple alone and the full fitted model. */
-interface Pred {
-  p: SnapshotProtocol;
-  /** The naive variant: TVL x the global median multiple, no category, no adjustments. */
-  naiveV: number;
-  baseV: number;
-  fittedV: number;
+/** A category's multiple before any cap or blend: shrunk toward the global median (no peers: the global median). */
+function shrunkMultiple(category: string | null, comps: Comparables): { pm: number; n: number } {
+  const cat = comps.byCategory.get(catKey(category));
+  const n = cat?.n ?? 0;
+  return { pm: peerMultiple(n, cat?.median ?? 0, comps.globalMedian), n };
 }
 
-/** Refit the multiples and the Huber fit on `train` alone, then predict every `test` peer. */
-function predictOut(train: SnapshotProtocol[], test: SnapshotProtocol[], snapshot: Snapshot, model: ModelConstants, drop = -1): Pred[] {
-  const comps = baseComparables(train, snapshot.protocols);
-  comps.fit = fitPeers(train, snapshot.as_of, comps, model, drop);
-  return test.map((p) => {
-    const baseV = p.tvl_usd * categoryMultiple(p.category, comps, model).pm;
-    return { p, naiveV: p.tvl_usd * comps.globalMedian, baseV, fittedV: baseV * adjustments(p, snapshot.as_of, comps, model).total };
+const sizeLog = (p: SnapshotProtocol): number => Math.log(Math.max(p.tvl_usd, 1) / FIT.size_scale_usd);
+const TERMS = ['ln TVL', '7d change', 'ln age', 'ln chains'];
+
+/** One protocol through the blended model, every step in logs. */
+export interface HybridCall {
+  value: number;
+  n: number;
+  /** Blend weight n / (n + k): how much of the category model's deviation from the curve the value keeps. */
+  w: number;
+  /** The multiple used: the shrunk one, held under capN. */
+  multiple: number;
+  /** ln of the power law at this TVL. */
+  curve: number;
+  /** ln(TVL x multiple). */
+  category: number;
+  /** The free size term. */
+  size: number;
+  /** The fitted terms before their clamp: base, growth, maturity, chains (and the placebo, when fitted). */
+  terms: number[];
+  /** Change made by clamping the sum of `terms` to [ln 0.5, ln 2]. */
+  clamp: number;
+  /** Change made by the thin-category cap on the deviation from the curve (0 unless it binds). */
+  cap: number;
+}
+
+/** The blended model fitted on a set of peers: a power law, and radar-6's category model refit without the family blend. */
+export interface Hybrid {
+  /** [intercept, slope]: ln mcap on ln(TVL / $100M). */
+  curve: number[];
+  /** [intercept, size, growth, maturity, chains, (placebo)], each term as coef x (feature - mean). */
+  coef: number[];
+  means: number[];
+  /** Nearest-rank P90 of ln(mcap / curve) over the training peers. */
+  resCap: number;
+  fallback: boolean;
+  comps: Comparables;
+  predict: (p: SnapshotProtocol, k: number) => HybridCall;
+}
+
+/**
+ * Fit the blended model. `drop` leaves one of the four terms out of the regression (ablation only); `placebo` adds a
+ * hash of the slug as a fifth term, a control that must not help. The Huber target is ln(mcap / (tvl x min(shrunk
+ * multiple, p90))): the unblended base with the original pooled cap.
+ */
+function fitHybrid(train: SnapshotProtocol[], asOf: string, all: SnapshotProtocol[], opt: { drop?: number; placebo?: boolean } = {}): Hybrid {
+  const comps = baseComparables(train, all);
+  const feats = (p: SnapshotProtocol): number[] => {
+    const f = featuresOf(p, asOf, comps, MODEL);
+    if (opt.placebo) f.push(Number.parseInt(fnv1a(`placebo|${p.slug}`), 16) / 2 ** 32 - 0.5);
+    return f;
+  };
+  const F = train.map(feats);
+  const m = F[0]?.length ?? 4;
+  const means = Array.from({ length: m }, (_, j) => F.reduce((s, f) => s + f[j]!, 0) / F.length);
+  const kept = Array.from({ length: m }, (_, j) => j).filter((j) => j !== opt.drop);
+  const y = train.map((p) => Math.log(p.mcap_usd! / (p.tvl_usd * Math.min(shrunkMultiple(p.category, comps).pm, comps.cap))));
+  const beta = F.length > kept.length + 1 ? huber(F.map((f) => [1, ...kept.map((j) => f[j]! - means[j]!)]), y) : null;
+  const coef = new Array<number>(m + 1).fill(0);
+  if (beta !== null) { coef[0] = beta[0]!; kept.forEach((j, i) => { coef[j + 1] = beta[i + 1]!; }); }
+  const curve = huber(train.map((p) => [1, sizeLog(p)]), train.map((p) => Math.log(p.mcap_usd!))) ?? [Math.log(comps.globalMedian), 1];
+  const curveAt = (p: SnapshotProtocol): number => curve[0]! + curve[1]! * sizeLog(p);
+  const res = train.map((p) => Math.log(p.mcap_usd!) - curveAt(p)).sort((a, b) => a - b);
+  const resCap = res[Math.max(0, Math.ceil(FIT.hybrid_cap_q * res.length) - 1)] ?? 0;
+  const capLog = Math.log(comps.cap / comps.globalMedian);
+  const lo = Math.log(FIT.factor_min);
+  const hi = Math.log(FIT.factor_max);
+  return {
+    curve, coef, means, resCap, fallback: beta === null, comps,
+    predict(p, k) {
+      const { pm, n } = shrunkMultiple(p.category, comps);
+      const w = n / (n + k);
+      const multiple = Math.min(pm, comps.globalMedian * Math.exp(w * capLog));
+      const x = feats(p).map((v, j) => v - means[j]!);
+      const terms = [coef[0]!, ...x.slice(1).map((v, j) => coef[j + 2]! * v)];
+      const nonSize = terms.reduce((s, v) => s + v, 0);
+      const size = coef[1]! * x[0]!;
+      const category = Math.log(p.tvl_usd * multiple);
+      const clamped = clampTo(nonSize, lo, hi);
+      const c = curveAt(p);
+      const dev = w * (category + size + clamped - c);
+      const cap = n < FIT.hybrid_cap_n ? Math.min(dev, resCap) - dev : 0;
+      return { value: Math.exp(c + dev + cap), n, w, multiple, curve: c, category, size, terms, clamp: clamped - nonSize, cap };
+    },
+  };
+}
+
+const absErr = (p: SnapshotProtocol, value: number): number => Math.abs(Math.log(p.mcap_usd! / value));
+
+/** The k in the grid with the lowest median abs log error under an inner leave-one-out over `train` (ties go to the smaller k). */
+function tuneK(train: SnapshotProtocol[], snapshot: Snapshot): { k: number; grid: [number, number][] } {
+  const errs = FIT.hybrid_k_grid.map(() => [] as number[]);
+  train.forEach((p, i) => {
+    const h = fitHybrid(train.filter((_, j) => j !== i), snapshot.as_of, snapshot.protocols);
+    FIT.hybrid_k_grid.forEach((k, g) => errs[g]!.push(absErr(p, h.predict(p, k).value)));
   });
+  const grid = FIT.hybrid_k_grid.map((k, g): [number, number] => [k, median(errs[g]!)]);
+  return { k: grid.reduce((best, x) => (x[1] < best[1] ? x : best))[0], grid };
 }
 
-/** Out-of-fold predictions: each fold is predicted by a model refit on the other folds. */
-function kfold(peers: SnapshotProtocol[], foldOf: (p: SnapshotProtocol) => number, k: number, snapshot: Snapshot, model: ModelConstants, drop = -1): Pred[] {
-  const out: Pred[] = [];
-  for (let f = 0; f < k; f++) {
-    const train = peers.filter((p) => foldOf(p) !== f);
-    const test = peers.filter((p) => foldOf(p) === f);
-    if (train.length > 0 && test.length > 0) out.push(...predictOut(train, test, snapshot, model, drop));
+/** Out-of-fold residuals ln(actual / predicted) of the blended model: 5 folds by slug, k chosen inside each fold. */
+function oofResiduals(rows: SnapshotProtocol[], snapshot: Snapshot): number[] {
+  const out: number[] = [];
+  for (let id = 0; id < FIT.cv_folds; id++) {
+    const train = rows.filter((p) => charSum(p.slug) % FIT.cv_folds !== id);
+    const test = rows.filter((p) => charSum(p.slug) % FIT.cv_folds === id);
+    if (train.length === 0 || test.length === 0) continue;
+    const { k } = tuneK(train, snapshot);
+    const h = fitHybrid(train, snapshot.as_of, snapshot.protocols);
+    for (const p of test) out.push(Math.log(p.mcap_usd! / h.predict(p, k).value));
   }
   return out;
 }
 
-const absLogErr = (xs: Pred[], f: (x: Pred) => number): number => median(xs.map((x) => Math.abs(Math.log(x.p.mcap_usd! / f(x)))));
+const bandOf = (resid: number[], lo: number, hi: number): [number, number] => [Math.min(0, quantile(resid, lo)), Math.max(0, quantile(resid, hi))];
 
-const NAIVE = (x: Pred): number => x.naiveV;
-const CATEGORY = (x: Pred): number => x.baseV;
-const FULL = (x: Pred): number => x.fittedV;
-const ABLATED_TERMS = ['ln TVL', '7d change', 'ln age', 'ln chains'];
-
-/** The validation ladder: every scheme refits the multiples, the shrinkage and the Huber fit on its own training part. */
-function buildLadder(peers: SnapshotProtocol[], oof5: Pred[], wf: Pred[], fold5: (p: SnapshotProtocol) => number, snapshot: Snapshot, model: ModelConstants): Ladder {
-  // Repeated 10-fold: each repeat orders the peers by a hash of "repeat|slug" and deals them into folds, so the folds are balanced and repeatable.
-  const rep10: Pred[] = [];
-  for (let r = 0; r < FIT.cv10_repeats; r++) {
-    const key = new Map(peers.map((p) => [p.slug, fnv1a(`${r}|${p.slug}`)]));
-    const order = [...peers].sort((a, b) => cmp(key.get(a.slug)!, key.get(b.slug)!) || cmp(a.slug, b.slug));
-    const fold = new Map(order.map((p, i) => [p.slug, i % FIT.cv10_folds]));
-    rep10.push(...kfold(peers, (p) => fold.get(p.slug)!, FIT.cv10_folds, snapshot, model));
-  }
-  const loo: Pred[] = peers.flatMap((p) => predictOut(peers.filter((q) => q !== p), [p], snapshot, model));
-
-  // Leave one category out: the full model on a category it never saw (categories with enough peers only).
-  const byCat = new Map<string, SnapshotProtocol[]>();
-  for (const p of peers) (byCat.get(catKey(p.category)) ?? byCat.set(catKey(p.category), []).get(catKey(p.category))!).push(p);
-  const locoAll: Pred[] = [];
-  const by_category = [...byCat].filter(([, v]) => v.length >= FIT.loco_min_peers).sort(([a], [b]) => cmp(a, b)).map(([category, test]) => {
-    const preds = predictOut(peers.filter((p) => catKey(p.category) !== category), test, snapshot, model);
-    locoAll.push(...preds);
-    return { category, n: test.length, naive: round4(absLogErr(preds, NAIVE)), category_only: round4(absLogErr(preds, CATEGORY)), full: round4(absLogErr(preds, FULL)) };
-  });
-
-  // Per-term ablation under the 5-fold scheme: drop one Huber term, refit inside every fold, compare with the full model.
-  const fullErr = absLogErr(oof5, FULL);
-  const terms = ABLATED_TERMS.map((term, j) => {
-    const error = absLogErr(kfold(peers, fold5, FIT.cv_folds, snapshot, model, j), FULL);
-    return { term, error: round4(error), delta: round4(error - fullErr) };
-  });
-
-  const sets = [oof5, rep10, loo, wf];
-  const err = (f: (x: Pred) => number): number[] => sets.map((s) => absLogErr(s, f));
-  const e = { naive: err(NAIVE), category: err(CATEGORY), full: err(FULL) };
-  const ratio = (a: number[], b: number[]): number[] => a.map((v, i) => round4(v / b[i]!));
-  const mk = (id: LadderRow['id'], label: string): LadderRow => ({ id, label, errors: e[id].map(round4), vs_naive: ratio(e[id], e.naive), vs_category: ratio(e[id], e.category) });
-  const rows = [mk('naive', 'Naive (global median)'), mk('category', 'Category-only (shrunk)'), mk('full', 'Full model (+ Huber)')];
-  const f2 = (v: number): string => v.toFixed(2);
-  const summary = `median abs log error, full / category-only / naive: ${['5-fold', `${FIT.cv10_folds}-fold x${FIT.cv10_repeats}`, 'LOO', 'walk-forward'].map((n, i) => `${n} ${f2(e.full[i]!)}/${f2(e.category[i]!)}/${f2(e.naive[i]!)}`).join(', ')}`;
-  return {
-    schemes: ['5-fold', `${FIT.cv10_folds}-fold x${FIT.cv10_repeats}`, 'Leave-one-out', 'Walk-forward'],
-    n: sets.map((x) => x.length),
-    rows,
-    repeats: FIT.cv10_repeats,
-    folds10: FIT.cv10_folds,
-    loco: { categories: by_category.length, n: locoAll.length, naive: round4(absLogErr(locoAll, NAIVE)), category_only: round4(absLogErr(locoAll, CATEGORY)), full: round4(absLogErr(locoAll, FULL)), by_category },
-    ablation: { full: round4(fullErr), terms },
-    summary,
-    note: `Not tuned inside the folds: the shrinkage weight ${MODEL.prior_weight}, the p90 cap level, the thin-category threshold ${FIT.thin_peers}, the Huber delta ${FIT.huber_k} and the 60/40 walk-forward split were set during development with the full peer set in view, so every error here is mildly optimistic.`,
-  };
+/** What every ladder rung predicts for one held-out peer. */
+interface Rungs {
+  p: SnapshotProtocol;
+  naive: number;
+  category: number;
+  curve: number;
+  radar6: number;
+  /** The shipped model with k tuned by an inner leave-one-out on the training part. */
+  hybrid: number;
+  /** At the fixed k, with the model whole, with each term dropped, and with the placebo added. */
+  fixed: number;
+  drops: number[];
+  placebo: number;
 }
 
-/** Validation: 5-fold CV and walk-forward, errors fitted vs category-only, the P25/P75 band and its walk-forward coverage. */
-export function validate(snapshot: Snapshot, model: ModelConstants = MODEL): FitReport {
-  const peers = snapshot.protocols.filter(isPeer).sort((a, b) => cmp(a.slug, b.slug));
-  const fold5 = (p: SnapshotProtocol): number => charSum(p.slug) % FIT.cv_folds;
-  const oof = kfold(peers, fold5, FIT.cv_folds, snapshot, model);
-  oof.sort((a, b) => cmp(a.p.slug, b.p.slug));
-  const resid = oof.map((x) => Math.log(x.p.mcap_usd! / x.fittedV));
-  const q25 = Math.min(0, quantile(resid, FIT.band_lo));
-  const q75 = Math.max(0, quantile(resid, FIT.band_hi));
-  const q10 = Math.min(0, quantile(resid, FIT.band80_lo));
-  const q90 = Math.max(0, quantile(resid, FIT.band80_hi));
+/** Refit everything on `train` alone and predict every `test` peer. */
+function predictRungs(train: SnapshotProtocol[], test: SnapshotProtocol[], snapshot: Snapshot, model: ModelConstants): Rungs[] {
+  const comps = baseComparables(train, snapshot.protocols);
+  comps.fit = fitPeers(train, snapshot.as_of, comps, model);
+  const { k } = tuneK(train, snapshot);
+  const fit = (opt?: { drop?: number; placebo?: boolean }): Hybrid => fitHybrid(train, snapshot.as_of, snapshot.protocols, opt);
+  const whole = fit();
+  const drops = TERMS.map((_, j) => fit({ drop: j }));
+  const placebo = fit({ placebo: true });
+  return test.map((p) => {
+    const baseV = p.tvl_usd * categoryMultiple(p.category, comps, model).pm;
+    const at = (h: Hybrid, kk: number): number => h.predict(p, kk).value;
+    return {
+      p, naive: p.tvl_usd * comps.globalMedian, category: baseV, curve: Math.exp(whole.predict(p, k).curve),
+      radar6: baseV * adjustments(p, snapshot.as_of, comps, model).total, hybrid: at(whole, k),
+      fixed: at(whole, FIT.hybrid_k), drops: drops.map((h) => at(h, FIT.hybrid_k)), placebo: at(placebo, FIT.hybrid_k),
+    };
+  });
+}
 
+/** The peers split by listed date: the earliest share to fit on, the rest to test (peers with no listed date count as oldest). */
+function walkSplit(peers: SnapshotProtocol[]): { train: SnapshotProtocol[]; test: SnapshotProtocol[]; dated: SnapshotProtocol[] } {
   const dated = [...peers].sort((a, b) => cmp(a.listed_at ?? '', b.listed_at ?? '') || cmp(a.slug, b.slug));
   const nFit = Math.round(dated.length * FIT.walk_train_share);
-  const wf = predictOut(dated.slice(0, nFit), dated.slice(nFit), snapshot, model);
-  const inside = wf.filter((x) => x.p.mcap_usd! >= x.fittedV * Math.exp(q25) && x.p.mcap_usd! <= x.fittedV * Math.exp(q75)).length;
-  const inside80 = wf.filter((x) => x.p.mcap_usd! >= x.fittedV * Math.exp(q10) && x.p.mcap_usd! <= x.fittedV * Math.exp(q90)).length;
-  const datedOnly = dated.filter((p) => p.listed_at !== null);
-  const ladder = buildLadder(peers, oof, wf, fold5, snapshot, model);
+  return { train: dated.slice(0, nFit), test: dated.slice(nFit), dated };
+}
 
-  const all = comparables(snapshot, model);
+const mdAle = (xs: Rungs[], f: (r: Rungs) => number): number => median(xs.map((r) => absErr(r.p, f(r))));
+const level = (xs: Rungs[], f: (r: Rungs) => number): number => xs.reduce((s, r) => s + f(r), 0) / xs.reduce((s, r) => s + r.p.mcap_usd!, 0);
+
+/** Validation: leave-one-out and the age-cohort walk-forward, the ladder, bands and their coverage, and the k check. */
+export function validate(snapshot: Snapshot, model: ModelConstants = MODEL): FitReport {
+  const peers = snapshot.protocols.filter(isPeer).sort((a, b) => cmp(a.slug, b.slug));
+  const walk = walkSplit(peers);
+  const loo = peers.flatMap((p) => predictRungs(peers.filter((q) => q !== p), [p], snapshot, model));
+  const wf = predictRungs(walk.train, walk.test, snapshot, model);
+
+  // Bands: quartiles and deciles of the full-sample out-of-fold residuals scale every row. Coverage is measured on the
+  // walk-forward test with bands built from its training part alone, so no test peer has touched its own band.
+  const resid = oofResiduals(peers, snapshot);
+  const [q25, q75] = bandOf(resid, FIT.band_lo, FIT.band_hi);
+  const [q10, q90] = bandOf(resid, FIT.band80_lo, FIT.band80_hi);
+  const trainResid = oofResiduals(walk.train, snapshot);
+  const cover = (lo: number, hi: number, testLo: number, testHi: number): BandReport => {
+    const inside = wf.filter((r) => r.p.mcap_usd! >= r.hybrid * Math.exp(testLo) && r.p.mcap_usd! <= r.hybrid * Math.exp(testHi)).length;
+    return { lo: round4(lo), hi: round4(hi), test_lo: round4(testLo), test_hi: round4(testHi), coverage: round4(wf.length === 0 ? 0 : inside / wf.length), inside, n: wf.length };
+  };
+  const [w25, w75] = bandOf(trainResid, FIT.band_lo, FIT.band_hi);
+  const [w10, w90] = bandOf(trainResid, FIT.band80_lo, FIT.band80_hi);
+
+  const sets = [loo, wf];
+  const rung = (id: string, label: string, f: (r: Rungs) => number): LadderRow => {
+    const errors = sets.map((s) => mdAle(s, f));
+    return { id, label, errors: errors.map(round4), vs_naive: errors.map((e, i) => round4(e / mdAle(sets[i]!, (r) => r.naive))), level: sets.map((s) => round4(level(s, f))) };
+  };
+  const rows = [
+    rung('naive', 'Naive: TVL × global median', (r) => r.naive),
+    rung('category', 'Category-only (shrunk)', (r) => r.category),
+    rung('curve', 'Power law alone: TVL only', (r) => r.curve),
+    rung('radar6', 'radar-6: category + fitted adjustments', (r) => r.radar6),
+    rung('hybrid', 'radar-7 (shipped): curve + category pull', (r) => r.hybrid),
+  ];
+  const reference = sets.map((s) => mdAle(s, (r) => r.fixed));
+  const change = (f: (r: Rungs) => number): number[] => sets.map((s, i) => round4(mdAle(s, f) - reference[i]!));
+  // A change under 0.01 of median abs log error is noise on 128 peers: it neither earns a term its place nor fails the control.
+  const verdictOf = (d: number[], placebo: boolean): string => {
+    const helps = d.filter((x) => (placebo ? x < -FIT.ladder_noise : x > FIT.ladder_noise)).length;
+    return placebo ? (helps === 0 ? 'control passes' : `control FAILS (${helps} of 2)`) : helps === 2 ? 'earns its place' : helps === 1 ? 'mixed: helps 1 of 2' : 'no held-out gain';
+  };
+  const terms = TERMS.map((term, j): [string, number, number, number, number, string] => {
+    const d = change((r) => r.drops[j]!);
+    return [`without ${term}`, round4(mdAle(loo, (r) => r.drops[j]!)), round4(mdAle(wf, (r) => r.drops[j]!)), d[0]!, d[1]!, verdictOf(d, false)];
+  });
+  const dp = change((r) => r.placebo);
+  terms.push(['plus hash noise', round4(mdAle(loo, (r) => r.placebo)), round4(mdAle(wf, (r) => r.placebo)), dp[0]!, dp[1]!, verdictOf(dp.map((x) => x), true)]);
+  const dCurve = change((r) => r.curve);
+  const ladder: Ladder = {
+    schemes: ['Leave-one-out', 'Walk-forward'],
+    n: sets.map((s) => s.length),
+    rows,
+    terms,
+    reference: reference.map(round4),
+    note: `Not tuned inside the folds: the shrinkage weight ${MODEL.prior_weight}, the p90 cap level, the thin-category threshold ${FIT.thin_peers}, the Huber delta ${FIT.huber_k}, the 60/40 walk-forward split and the k grid were set with the full peer set in view, so every error here is mildly optimistic. The walk-forward is an age-cohort split of one snapshot, not a backtest.`,
+  };
+
+  const all = fitHybrid(peers, snapshot.as_of, snapshot.protocols);
+  const tuned = tuneK(peers, snapshot);
   const log10 = (v: number): number => Math.round((Math.log(v) / Math.LN10) * 1000) / 1000;
+  const datedOnly = walk.dated.filter((p) => p.listed_at !== null);
   return {
     fit_method: `huber-irls-${FIT.huber_iters}`,
-    features: ['intercept', 'ln TVL', '7d change (clamped ±50)', 'ln age (years)', 'ln chains'],
-    coefficients: all.fit.coef.map(round4),
-    means: all.fit.means.map(round4),
-    fallback: all.fit.fallback,
-    peers_fit_all: all.peerTotal,
-    error_fitted: round4(absLogErr(oof, (x) => x.fittedV)),
-    error_median_only: round4(absLogErr(oof, (x) => x.baseV)),
-    cv: { n: oof.length, fitted: round4(absLogErr(oof, (x) => x.fittedV)), baseline: round4(absLogErr(oof, (x) => x.baseV)), folds: FIT.cv_folds },
-    walk: {
-      n: wf.length,
-      n_fit: nFit,
-      fitted: round4(absLogErr(wf, (x) => x.fittedV)),
-      baseline: round4(absLogErr(wf, (x) => x.baseV)),
-      from: datedOnly[0]?.listed_at ?? '',
-      to: datedOnly[datedOnly.length - 1]?.listed_at ?? '',
-      undated: dated.length - datedOnly.length,
-    },
-    band: { q25: round4(q25), q75: round4(q75), coverage: round4(wf.length === 0 ? 0 : inside / wf.length), inside, n: wf.length },
-    band80: { q10: round4(q10), q90: round4(q90), coverage: round4(wf.length === 0 ? 0 : inside80 / wf.length), inside: inside80, n: wf.length },
+    features: ['intercept', 'ln TVL (size, free)', '7d change (clamped ±50)', 'ln age (years)', 'ln chains'],
+    coefficients: all.coef.map(round4),
+    means: all.means.map(round4),
+    curve: all.curve.map(round4),
+    k: FIT.hybrid_k,
+    k_loo: tuned.k,
+    k_grid: tuned.grid.map(([k, e]) => [k, round4(e)]),
+    residual_cap: round4(all.resCap),
+    fallback: all.fallback,
+    peers_fit_all: all.comps.peerTotal,
+    loo: { n: loo.length, fitted: round4(mdAle(loo, (r) => r.hybrid)), baseline: round4(mdAle(loo, (r) => r.category)) },
+    walk: { n: wf.length, n_fit: walk.train.length, fitted: round4(mdAle(wf, (r) => r.hybrid)), baseline: round4(mdAle(wf, (r) => r.category)), from: datedOnly[0]?.listed_at ?? '', to: datedOnly[datedOnly.length - 1]?.listed_at ?? '', undated: walk.dated.length - datedOnly.length },
+    level: { loo: round4(level(loo, (r) => r.hybrid)), walk: round4(level(wf, (r) => r.hybrid)) },
+    band: cover(q25, q75, w25, w75),
+    band80: cover(q10, q90, w10, w90),
     ladder,
-    scatter: oof.map((x) => [log10(x.fittedV), log10(x.p.mcap_usd!)]),
+    factors: [['Category multiple vs curve', dCurve[0]!, dCurve[1]!], ['Size term', terms[0]![3], terms[0]![4]], ['Growth term', terms[1]![3], terms[1]![4]], ['Maturity term', terms[2]![3], terms[2]![4]], ['Chains term', terms[3]![3], terms[3]![4]]],
+    scatter: loo.map((r) => [log10(r.hybrid), log10(r.p.mcap_usd!)]),
   };
 }
 
-/** One protocol's implied value, the factors behind it, and the clamp (1 unless the combined [0.5, 2] clamp binds). */
-export function impliedValue(p: SnapshotProtocol, asOf: string, comps: Comparables, model: ModelConstants = MODEL): { implied: number; breakdown: ModelBreakdown; clamp: number; base: number } {
-  const { pm, n } = categoryMultiple(p.category, comps, model);
-  const a = adjustments(p, asOf, comps, model);
-  const base = p.tvl_usd * pm;
-  const implied = Math.max(1, Math.round(base * a.total));
+/** One protocol's implied value and the workings behind it. */
+export function impliedValue(p: SnapshotProtocol, asOf: string, h: Hybrid): { implied: number; breakdown: ModelBreakdown; call: HybridCall } {
+  const call = h.predict(p, FIT.hybrid_k);
+  const [base, growth, maturity, chain] = call.terms;
   return {
-    implied,
-    clamp: a.clamp,
-    base,
+    implied: Math.max(1, Math.round(call.value)),
+    call,
     breakdown: {
-      peer_multiple: round4(pm),
-      peer_count: n,
-      size_adj: round4(a.size),
-      growth_adj: round4(a.growth),
-      maturity_adj: round4(a.maturity),
-      chain_adj: round4(a.chain),
-      base_adj: round4(a.base),
-      confidence: round4(n / (n + FIT.confidence_k)),
-      age_days: a.age,
+      peer_multiple: round4(call.multiple),
+      peer_count: call.n,
+      size_adj: round4(Math.exp(call.size)),
+      growth_adj: round4(Math.exp(growth!)),
+      maturity_adj: round4(Math.exp(maturity!)),
+      chain_adj: round4(Math.exp(chain!)),
+      base_adj: round4(Math.exp(base!)),
+      confidence: round4(call.w),
+      age_days: ageDays(asOf, p.listed_at),
     },
   };
 }
@@ -885,12 +1065,14 @@ export function oddsScope(snapshot: Snapshot): SnapshotProtocol[] {
 }
 
 interface ShareCounts {
+  /** Pseudo-protocols of the global rate mixed into every category's share. */
+  smoothing: number;
   globalRate: number;
   byCategory: Map<string, { tokenized: number; pre_token: number }>;
 }
 
 /** Tokenized and pre-token counts per category over a set of protocols, and the global tokenized rate. */
-function shareCounts(pop: SnapshotProtocol[]): ShareCounts {
+function shareCounts(pop: SnapshotProtocol[], smoothing: number): ShareCounts {
   const byCategory = new Map<string, { tokenized: number; pre_token: number }>();
   let tok = 0;
   for (const p of pop) {
@@ -898,7 +1080,7 @@ function shareCounts(pop: SnapshotProtocol[]): ShareCounts {
     if (isPreToken(p)) c.pre_token++; else { c.tokenized++; tok++; }
     byCategory.set(catKey(p.category), c);
   }
-  return { globalRate: pop.length === 0 ? 0.5 : tok / pop.length, byCategory };
+  return { smoothing, globalRate: pop.length === 0 ? 0.5 : tok / pop.length, byCategory };
 }
 
 /** A category's tokenized share, shrunk toward the global rate; `self` removes the protocol's own record (leave-one-out). */
@@ -907,12 +1089,12 @@ function shrunkShare(sc: ShareCounts, category: string | null, self: SnapshotPro
   let tok = c.tokenized;
   let n = c.tokenized + c.pre_token;
   if (self !== null) { n--; if (!isPreToken(self)) tok--; }
-  return (tok + FIT.odds_smoothing * sc.globalRate) / (n + FIT.odds_smoothing);
+  return (tok + sc.smoothing * sc.globalRate) / (n + sc.smoothing);
 }
 
 /** Per-category launch basis over the scope: tokenized vs pre-token counts and the shrunk share. */
-export function launchOdds(snapshot: Snapshot): { globalRate: number; byCategory: Map<string, OddsRow> } {
-  const sc = shareCounts(oddsScope(snapshot));
+export function launchOdds(snapshot: Snapshot, smoothing: number): { globalRate: number; byCategory: Map<string, OddsRow> } {
+  const sc = shareCounts(oddsScope(snapshot), smoothing);
   const byCategory = new Map<string, OddsRow>();
   for (const [category, c] of sc.byCategory) {
     byCategory.set(category, { category, tokenized: c.tokenized, pre_token: c.pre_token, odds: round4(shrunkShare(sc, category, null)) });
@@ -936,8 +1118,8 @@ function propFeatures(p: SnapshotProtocol, asOf: string, pr: { zMean: number; zS
 }
 
 /** Fit the propensity on `train`: L2 (lambda on non-intercept weights), Newton, exactly 50 iterations from zero. */
-export function fitPropensity(train: SnapshotProtocol[], asOf: string): Propensity {
-  const counts = shareCounts(train);
+export function fitPropensity(train: SnapshotProtocol[], asOf: string, smoothing: number): Propensity {
+  const counts = shareCounts(train, smoothing);
   const lt = train.map((p) => Math.log(Math.max(p.tvl_usd, 1)));
   const zMean = lt.reduce((s, v) => s + v, 0) / Math.max(lt.length, 1);
   const zSd = Math.sqrt(lt.reduce((s, v) => s + (v - zMean) ** 2, 0) / Math.max(lt.length, 1)) || 1;
@@ -977,18 +1159,44 @@ export function propensityOf(p: SnapshotProtocol, asOf: string, pr: Propensity, 
 
 const oddsClamp = (v: number): number => round4(clampTo(v, FIT.odds_min, FIT.odds_max));
 
-/** The propensity's report: the all-scope fit, and Brier on the held half of a slug-parity split against the base rate. */
-export function oddsReport(snapshot: Snapshot, pr: Propensity): OddsReport {
+/** The scope in slug order, split by parity into the half the propensity is fitted on and the half it is scored on. */
+function oddsHalves(snapshot: Snapshot): { train: SnapshotProtocol[]; test: SnapshotProtocol[] } {
   const scope = oddsScope(snapshot).sort((a, b) => cmp(a.slug, b.slug));
-  const train = scope.filter((_, i) => i % 2 === 0);
-  const test = scope.filter((_, i) => i % 2 === 1);
-  const half = fitPropensity(train, snapshot.as_of);
-  const rate = shareCounts(train).globalRate;
+  return { train: scope.filter((_, i) => i % 2 === 0), test: scope.filter((_, i) => i % 2 === 1) };
+}
+
+/** Brier score of the propensity, fitted on the train half with this smoothing, over the held half. */
+function heldBrier(snapshot: Snapshot, smoothing: number): number {
+  const { train, test } = oddsHalves(snapshot);
+  const half = fitPropensity(train, snapshot.as_of, smoothing);
+  return test.reduce((s, p) => s + (clampTo(propensityOf(p, snapshot.as_of, half, false), FIT.odds_min, FIT.odds_max) - (isPreToken(p) ? 0 : 1)) ** 2, 0) / Math.max(test.length, 1);
+}
+
+/**
+ * The in-fit odds test: smooth the category share harder (inside the logistic, where it is a feature) and keep the
+ * larger constant only if the held half's Brier stays within the tolerance of the current constant's. Run on the
+ * same split every build; the verdict is part of the report.
+ */
+export function oddsExperiment(snapshot: Snapshot): OddsExperiment {
+  const current = round4(heldBrier(snapshot, FIT.odds_smoothing));
+  const variant = round4(heldBrier(snapshot, FIT.odds_smoothing_variant));
+  return { current: FIT.odds_smoothing, variant: FIT.odds_smoothing_variant, brier_current: current, brier_variant: variant, tolerance: FIT.odds_brier_tolerance, adopted: variant <= current + FIT.odds_brier_tolerance };
+}
+
+/** The smoothing constant the build scores with: the variant if the test adopts it. */
+export const oddsSmoothing = (e: OddsExperiment): number => (e.adopted ? e.variant : e.current);
+
+/** The propensity's report: the all-scope fit, and Brier on the held half of a slug-parity split against the base rate. */
+export function oddsReport(snapshot: Snapshot, pr: Propensity, experiment: OddsExperiment): OddsReport {
+  const scope = oddsScope(snapshot);
+  const { train, test } = oddsHalves(snapshot);
+  const smoothing = oddsSmoothing(experiment);
+  const rate = shareCounts(train, smoothing).globalRate;
   const brier = (f: (p: SnapshotProtocol) => number): number => test.reduce((s, p) => s + (f(p) - (isPreToken(p) ? 0 : 1)) ** 2, 0) / Math.max(test.length, 1);
-  const lo = launchOdds(snapshot);
+  const lo = launchOdds(snapshot, smoothing);
   return {
     global_rate: round4(lo.globalRate),
-    smoothing: FIT.odds_smoothing,
+    smoothing,
     categories: [...lo.byCategory.values()].sort((a, b) => b.tokenized + b.pre_token - (a.tokenized + a.pre_token) || cmp(a.category, b.category)),
     features: ['intercept', 'category tokenized share', 'ln TVL (z)', 'ln chains', 'ln age (years)'],
     coefficients: pr.coef.map(round4),
@@ -997,8 +1205,9 @@ export function oddsReport(snapshot: Snapshot, pr: Propensity): OddsReport {
     n_scope: scope.length,
     n_train: train.length,
     n_test: test.length,
-    brier_propensity: round4(brier((p) => clampTo(propensityOf(p, snapshot.as_of, half, false), FIT.odds_min, FIT.odds_max))),
+    brier_propensity: round4(heldBrier(snapshot, smoothing)),
     brier_base: round4(brier(() => rate)),
+    experiment,
   };
 }
 
@@ -1048,10 +1257,11 @@ const usd = (n: number): string => (n >= 10 ? `$${Math.round(n).toLocaleString('
  * Farm totals and the costed verdict for one row. All-in cost = fees + hours x $15 + capital opportunity
  * (deposit x 4.5% APR x hold weeks / 52; the hold is the plan's own, or 8 weeks if it has none).
  * Worth it: point EV >= 3x all-in AND P25 EV >= 1x all-in. Marginal: point EV >= 1x all-in but not Worth it. Skip: point EV < 1x all-in.
+ * A THIN row (its category has under 3 peers) is never Worth it: the label is capped at Marginal and the text says so.
  */
 export function farmVerdict(
-  steps: FarmStep[], ev: number, riskAdjusted: number, participants: number, deposit: number, holdDays: number | null, evP25: number, odds: number,
-): { cost: number; hours: number; verdict: string; hold_weeks: number; opportunity: number; all_in: number; ratio: number; ratio_p25: number; break_even: number; deposit_net: [number, number][] } {
+  steps: FarmStep[], ev: number, riskAdjusted: number, participants: number, deposit: number, holdDays: number | null, evP25: number, odds: number, thinPeers: number | null = null,
+): { cost: number; hours: number; verdict: string; capped: boolean; hold_weeks: number; opportunity: number; all_in: number; ratio: number; ratio_p25: number; break_even: number; deposit_net: [number, number][] } {
   const cost = Math.round(steps.reduce((s, x) => s + x.cost_usd, 0) * 100) / 100;
   const hours = Math.round(steps.reduce((s, x) => s + x.hours, 0) * 100) / 100;
   const holdWeeks = holdDays === null ? FIT.hold_weeks_fallback : holdDays / 7;
@@ -1064,9 +1274,11 @@ export function farmVerdict(
   // Deposit sensitivity: proceeds are an equal per-wallet split, so only the opportunity term moves with the deposit.
   const fixed = cost + hours * FIT.hour_value_usd;
   const depositNet = DEPOSIT_SENSITIVITY.map((d): [number, number] => [d, Math.round((ev - (fixed + d * FIT.capital_apr * (holdWeeks / 52))) * 100) / 100]);
-  const label = ratio >= FIT.worth_ratio && ratioP25 >= FIT.worth_p25_floor ? 'Worth it' : ratio >= FIT.marginal_ratio ? 'Marginal' : 'Skip';
-  const verdict = `${label}: point EV ${usd(ev)} a wallet (risk-adjusted ${usd(riskAdjusted)} x ${FIT.airdrop_pool_share * 100}% pool / ${participants.toLocaleString('en-US')} wallets), P25 EV ${usd(evP25)}, vs all-in ${usd(allIn)} (${usd(cost)} fees + ${hours.toFixed(1)}h x $${FIT.hour_value_usd} + ${usd(opportunity)} opportunity on $${deposit.toLocaleString('en-US')} for ${holdWeeks.toFixed(1)} weeks at ${(FIT.capital_apr * 100).toFixed(1)}%): EV/cost ${ratio.toFixed(2)}x point, ${ratioP25.toFixed(2)}x P25. Break-even launch value ${wholeUsd(breakEven)} (point EV equals all-in cost).`;
-  return { cost, hours, verdict, hold_weeks: holdWeeks, opportunity, all_in: allIn, ratio, ratio_p25: ratioP25, break_even: breakEven, deposit_net: depositNet };
+  const rule = ratio >= FIT.worth_ratio && ratioP25 >= FIT.worth_p25_floor ? 'Worth it' : ratio >= FIT.marginal_ratio ? 'Marginal' : 'Skip';
+  const capped = thinPeers !== null && rule === 'Worth it';
+  const label = capped ? FIT.thin_verdict_cap : rule;
+  const verdict = `${label}: point EV ${usd(ev)} a wallet (risk-adjusted ${usd(riskAdjusted)} x ${FIT.airdrop_pool_share * 100}% pool / ${participants.toLocaleString('en-US')} wallets), P25 EV ${usd(evP25)}, vs all-in ${usd(allIn)} (${usd(cost)} fees + ${hours.toFixed(1)}h x $${FIT.hour_value_usd} + ${usd(opportunity)} opportunity on $${deposit.toLocaleString('en-US')} for ${holdWeeks.toFixed(1)} weeks at ${(FIT.capital_apr * 100).toFixed(1)}%): EV/cost ${ratio.toFixed(2)}x point, ${ratioP25.toFixed(2)}x P25. Break-even launch value ${wholeUsd(breakEven)} (point EV equals all-in cost).${capped ? ` THIN: the category has ${thinPeers} peer${thinPeers === 1 ? '' : 's'}, under ${FIT.thin_peers}, so a rule-level Worth it is capped at ${FIT.thin_verdict_cap}.` : ''}`;
+  return { cost, hours, verdict, capped, hold_weeks: holdWeeks, opportunity, all_in: allIn, ratio, ratio_p25: ratioP25, break_even: breakEven, deposit_net: depositNet };
 }
 
 /** FNV-1a (32-bit) of a string's UTF-8 bytes, as 8 hex digits. */
@@ -1077,7 +1289,7 @@ export function fnv1a(text: string): string {
 }
 
 /** What the dashboard shows beside a board row and the board itself does not carry. */
-export type RowExtras = Pick<RadarRow, 'value_low' | 'value_high' | 'range_level' | 'value_p25' | 'rank_low' | 'rank_high' | 'confidence' | 'promoted' | 'why' | 'cat_share' | 'clamp_adj' | 'waterfall' | 'nearest' | 'plan'>;
+export type RowExtras = Pick<RadarRow, 'value_low' | 'value_high' | 'range_level' | 'value_p25' | 'rank_low' | 'rank_high' | 'confidence' | 'promoted' | 'why' | 'cat_share' | 'clamp_adj' | 'thin' | 'verdict_capped' | 'waterfall' | 'nearest' | 'plan'>;
 
 /**
  * Up to 3 tokenized peers of the same category, nearest in TVL (|ln of the ratio|), ties by slug. When fewer than 3
@@ -1097,16 +1309,16 @@ export function nearestPeers(p: SnapshotProtocol, peers: SnapshotProtocol[]): Ne
 
 /** The board and, per slug, the extras only the dashboard shows. `validation` and `prop` are the fits to score with. */
 function scoreBoard(snapshot: Snapshot, model: ModelConstants, validation: FitReport, prop: Propensity): { board: BoardRow[]; extras: Map<string, RowExtras>; quarantined: Quarantined[] } {
-  const comps = comparables(snapshot, model);
+  const peers = snapshot.protocols.filter(isPeer);
+  const h = fitHybrid(peers, snapshot.as_of, snapshot.protocols);
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const watch = new Set(snapshot.watchlist);
-  const peers = snapshot.protocols.filter(isPeer);
   const chosen = new Map<string, SnapshotProtocol>();
   for (const slug of snapshot.watchlist) {
     const p = index.get(slug);
     if (p !== undefined) chosen.set(slug, p);
   }
-  const score = (p: SnapshotProtocol) => ({ p, ...impliedValue(p, snapshot.as_of, comps, model) });
+  const score = (p: SnapshotProtocol) => ({ p, ...impliedValue(p, snapshot.as_of, h) });
   const early = snapshot.protocols
     .filter((p) => !chosen.has(p.slug) && p.tvl_usd < snapshot.floor_usd && isRankable(p))
     .map(score)
@@ -1135,22 +1347,25 @@ function scoreBoard(snapshot: Snapshot, model: ModelConstants, validation: FitRe
     const risk = Math.round(s.implied * launch);
     const plan = farmPlan(s.p, s.breakdown.age_days);
     const ev = (s.implied * launch * FIT.airdrop_pool_share) / plan.participants;
-    const valueLow = Math.max(1, Math.min(s.implied, Math.round(s.implied * Math.exp(validation.band.q25))));
+    const valueLow = Math.max(1, Math.min(s.implied, Math.round(s.implied * Math.exp(validation.band.lo))));
     const evP25 = (valueLow * launch * FIT.airdrop_pool_share) / plan.participants;
-    const fv = farmVerdict(plan.steps, ev, risk, plan.participants, plan.deposit, plan.hold_days, evP25, launch);
+    const thin = s.breakdown.peer_count < FIT.thin_peers;
+    const fv = farmVerdict(plan.steps, ev, risk, plan.participants, plan.deposit, plan.hold_days, evP25, launch, thin ? s.breakdown.peer_count : null);
     // Range shown: the 50% band, or the wider 80% band for a low-confidence (promoted) row. The verdict keeps using the P25 value.
     const lowConf = promoted.has(s.p.slug);
-    const shownLow = lowConf ? Math.max(1, Math.min(s.implied, Math.round(s.implied * Math.exp(validation.band80.q10)))) : valueLow;
-    const shownHigh = Math.max(s.implied, Math.round(s.implied * Math.exp(lowConf ? validation.band80.q90 : validation.band.q75)));
+    const shownLow = lowConf ? Math.max(1, Math.min(s.implied, Math.round(s.implied * Math.exp(validation.band80.lo)))) : valueLow;
+    const shownHigh = Math.max(s.implied, Math.round(s.implied * Math.exp(lowConf ? validation.band80.hi : validation.band.hi)));
     // Where the range's ends would sit in the board's point-value ordering: 1 + the rows (other than this one) strictly above.
     const rankAt = (v: number): number => 1 + scored.reduce((n, o, j) => n + (j !== i && o.implied > v ? 1 : 0), 0);
-    const m = s.breakdown;
-    let v = s.base;
-    const wf: [string, number | null, number][] = [['Base value: TVL x peer multiple', null, Math.round(v)]];
-    for (const [label, f] of [['Fitted base', m.base_adj], ['Size', m.size_adj], ['Growth', m.growth_adj], ['Maturity', m.maturity_adj], ['Chains', m.chain_adj], ['Combined clamp', round4(s.clamp)]] as [string, number][]) {
-      if (label === 'Combined clamp' && f === 1) continue;
-      v *= f;
-      wf.push([label, f, Math.round(v)]);
+    // The waterfall starts at the power law's value and applies each step's share of the blended log, weight w on every one, so the steps multiply to the implied value.
+    const call = s.call;
+    let v = Math.exp(call.curve);
+    const wf: [string, number | null, number][] = [['Power-law curve (TVL only)', null, Math.round(v)]];
+    const steps: [string, number][] = [['Category multiple vs curve', call.w * (call.category - call.curve)], ['Size term', call.w * call.size], ['Base fit', call.w * call.terms[0]!], ['Growth term', call.w * call.terms[1]!], ['Maturity term', call.w * call.terms[2]!], ['Chains term', call.w * call.terms[3]!], ['Combined clamp', call.w * call.clamp], ['THIN cap', call.cap]];
+    for (const [label, log] of steps) {
+      if ((label === 'Combined clamp' || label === 'THIN cap') && log === 0) continue;
+      v *= Math.exp(log);
+      wf.push([label, round4(Math.exp(log)), Math.round(v)]);
     }
     wf.push(['Implied value', null, s.implied]);
     extras.set(s.p.slug, {
@@ -1162,9 +1377,11 @@ function scoreBoard(snapshot: Snapshot, model: ModelConstants, validation: FitRe
       rank_high: rankAt(shownLow),
       confidence: lowConf ? 'low' : 'normal',
       promoted: lowConf,
-      ...(lowConf ? { why: whyPromoted(s.p, s.breakdown, comps, snapshot.floor_usd) } : {}),
+      ...(lowConf ? { why: whyPromoted(s.p, s.breakdown, h.comps, snapshot.floor_usd) } : {}),
       cat_share: round4(shrunkShare(prop.counts, s.p.category, inScope ? s.p : null)),
-      clamp_adj: round4(s.clamp),
+      clamp_adj: round4(Math.exp(s.call.w * s.call.clamp)),
+      thin,
+      verdict_capped: fv.capped,
       waterfall: wf,
       nearest: nearestPeers(s.p, peers),
       plan: {
@@ -1227,20 +1444,17 @@ export function quarantineReason(p: SnapshotProtocol, floor: number): string | n
 /** The WHY line of a promoted row: the multiple's source, stated as the pipeline used it. */
 function whyPromoted(p: SnapshotProtocol, b: ModelBreakdown, comps: Comparables, floor: number): string {
   const cat = catKey(p.category);
-  const kind = kindOfCategory(p.category);
-  const fam = comps.byKind.has(kind);
   const n = b.peer_count;
   const how =
-    n >= FIT.thin_peers ? `the category's shrunk multiple (${n} peers)`
-      : n >= 1 ? `the category's shrunk multiple (only ${n} peer${n === 1 ? '' : 's'}), blended with the ${kind} family median`
-        : fam ? `no peers in the category, so the ${kind} family median stands in for the global median (${comps.globalMedian.toFixed(4)})`
-          : `no peers in the category and no family, so the global median (${comps.globalMedian.toFixed(4)})`;
+    n >= FIT.thin_peers ? `the category's shrunk multiple (${n} peers), pulling the value ${Math.round(b.confidence * 100)}% of the way from the power law`
+      : n >= 1 ? `the category's shrunk multiple (only ${n} peer${n === 1 ? '' : 's'}), so the value keeps ${Math.round(b.confidence * 100)}% of its deviation from the power law`
+        : `no peers in the category, so the value is the power law's (global median x${comps.globalMedian.toFixed(4)} caps the multiple)`;
   return `Promoted from the set-aside list: TVL ${wholeUsd(p.tvl_usd)} (floor ${wholeUsd(floor)}) and ${p.chains.length} chain${p.chains.length === 1 ? '' : 's'}. Multiple x${b.peer_multiple.toFixed(4)} for ${cat}: ${how}. Low confidence, shown with the 80% band.`;
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  return scoreBoard(snapshot, model, validate(snapshot, model), fitPropensity(oddsScope(snapshot), snapshot.as_of)).board;
+  return scoreBoard(snapshot, model, validate(snapshot, model), fitPropensity(oddsScope(snapshot), snapshot.as_of, oddsSmoothing(oddsExperiment(snapshot)))).board;
 }
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 characters. */
@@ -1450,12 +1664,13 @@ export function coverage(snapshot: Snapshot, board: BoardRow[], extras: Map<stri
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const validation = validate(snapshot, model);
-  const prop = fitPropensity(oddsScope(snapshot), snapshot.as_of);
+  const experiment = oddsExperiment(snapshot);
+  const prop = fitPropensity(oddsScope(snapshot), snapshot.as_of, oddsSmoothing(experiment));
   const { board, extras, quarantined } = scoreBoard(snapshot, model, validation, prop);
   const live = liveRows(snapshot);
-  const comps = comparables(snapshot, model);
+  const comps = comparables(snapshot);
   const peers: PeerRow[] = [...comps.byCategory]
-    .map(([category, v]) => ({ category, n: v.n, median_multiple: round4(v.median), multiple: round4(categoryMultiple(category, comps, model).pm) }))
+    .map(([category, v]) => ({ category, n: v.n, median_multiple: round4(v.median), multiple: round4(shrunkMultiple(category, comps).pm) }))
     .sort((a, b) => b.n - a.n || cmp(a.category, b.category));
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -1480,7 +1695,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     coverage: coverage(snapshot, board, extras),
     quarantined,
     integrity: [],
-    odds: oddsReport(snapshot, prop),
+    odds: oddsReport(snapshot, prop, experiment),
     farm: {
       airdrop_pool_share: FIT.airdrop_pool_share,
       hour_value_usd: FIT.hour_value_usd,
@@ -1574,22 +1789,35 @@ export function integrityChecks(snapshot: Snapshot, board: BoardRow[], radar: Ra
     const ev = (r.implied_value_usd * r.launch_odds * FIT.airdrop_pool_share) / pl.participants;
     const evP25 = (r.value_p25 * r.launch_odds * FIT.airdrop_pool_share) / pl.participants;
     const allIn = r.farm_cost_usd + r.farm_hours * FIT.hour_value_usd + (pl.deposit_usd * FIT.capital_apr * (pl.hold_days / 7)) / 52;
-    const label = ev / allIn >= FIT.worth_ratio && evP25 / allIn >= FIT.worth_p25_floor ? 'Worth it' : ev / allIn >= FIT.marginal_ratio ? 'Marginal' : 'Skip';
+    const rule = ev / allIn >= FIT.worth_ratio && evP25 / allIn >= FIT.worth_p25_floor ? 'Worth it' : ev / allIn >= FIT.marginal_ratio ? 'Marginal' : 'Skip';
+    const label = r.thin && rule === 'Worth it' ? FIT.thin_verdict_cap : rule;
     const breakEven = (allIn * pl.participants) / (FIT.airdrop_pool_share * r.launch_odds);
     const ok = near(ev, pl.ev_wallet_usd, 0.0051) && near(evP25, pl.ev_p25_wallet_usd, 0.0051) && near(allIn, pl.all_in_usd, 0.0051) &&
       near(breakEven, pl.break_even_value_usd, 1) && near(evP25 - allIn, pl.net_p25_usd, 0.0101) && near(ev - allIn, pl.net_point_usd, 0.0101) &&
-      label === r.farm_verdict.split(':')[0] && r.farm_verdict.includes(`Break-even launch value ${wholeUsd(breakEven)}`);
+      label === r.farm_verdict.split(':')[0] && r.thin === r.model.peer_count < FIT.thin_peers && r.verdict_capped === (label !== rule) && r.farm_verdict.includes(`Break-even launch value ${wholeUsd(breakEven)}`);
     if (!ok) bad++;
   }
-  check('farm', 'Farm reconciliation', `${radar.rows.length} rows rebuilt (point EV, P25 EV, all-in, break-even, verdict label): ${bad} mismatches`, `${bad} mismatches in ${radar.rows.length} rows`, bad === 0);
+  check('farm', 'Farm reconciliation', `${radar.rows.length} rows rebuilt (point EV, P25 EV, all-in, break-even, THIN cap, verdict label): ${bad} mismatches`, `${bad} mismatches in ${radar.rows.length} rows`, bad === 0);
 
   // 5. The validation ladder, as text.
   const L = radar.fit.ladder;
-  check('ladder', 'Validation ladder', L.summary, `full ${L.rows[2]!.errors.map((v) => v.toFixed(2)).join('/')} vs naive ${L.rows[0]!.errors.map((v) => v.toFixed(2)).join('/')}`, null, 'info');
+  const e2 = (xs: number[]): string => xs.map((v) => v.toFixed(2)).join('/');
+  const shipped = L.rows[L.rows.length - 1]!;
+  check('ladder', 'Validation ladder', `median abs log error, leave-one-out / walk-forward: ${L.rows.map((r) => `${r.label} ${e2(r.errors)}`).join('; ')}`, `shipped ${e2(shipped.errors)} vs naive ${e2(L.rows[0]!.errors)}`, null, 'info');
+
+  // The thin rule: rows in categories under 3 peers carry the tag, and the cap's effect on verdicts is counted.
+  const thinRows = radar.rows.filter((r) => r.thin);
+  const capped = radar.rows.filter((r) => r.verdict_capped).length;
+  check('thin', 'Thin rule', `${thinRows.length} of ${radar.rows.length} rows are THIN (category under ${FIT.thin_peers} peers); the cap turned ${capped} Worth it into Marginal`, `${thinRows.length} THIN, ${capped} capped`, thinRows.every((r) => !r.farm_verdict.startsWith('Worth it')));
+
+  // The odds test and the k check, reported as computed.
+  const x = radar.odds.experiment;
+  check('odds', 'Odds test', `smoothing ${x.variant} vs ${x.current} on the held half: Brier ${x.brier_variant} vs ${x.brier_current} (tolerance +${x.tolerance}): ${x.adopted ? 'adopted' : 'rejected'}`, `${x.adopted ? 'adopted' : 'rejected'}: ${x.brier_variant} vs ${x.brier_current}`, null, 'info');
+  check('k', 'Blend constant', `k = ${radar.fit.k} shipped; an inner leave-one-out over all ${radar.peer_total} peers picks ${radar.fit.k_loo}`, `k ${radar.fit.k}`, radar.fit.k === radar.fit.k_loo);
 
   // 6. Band coverage against nominal.
   const pct = (b: { coverage: number; inside: number; n: number }): string => `${(b.coverage * 100).toFixed(1)}% (${b.inside}/${b.n})`;
-  check('bands', 'Band coverage', `walk-forward: 50% band ${pct(radar.fit.band)} vs 50% nominal; 80% band ${pct(radar.fit.band80)} vs 80% nominal`, `50%: ${(radar.fit.band.coverage * 100).toFixed(1)}% · 80%: ${(radar.fit.band80.coverage * 100).toFixed(1)}%`, null, 'info');
+  check('bands', 'Band coverage', `walk-forward, bands built from the training part alone: 50% band ${pct(radar.fit.band)} vs 50% nominal; 80% band ${pct(radar.fit.band80)} vs 80% nominal`, `50%: ${(radar.fit.band.coverage * 100).toFixed(1)}% · 80%: ${(radar.fit.band80.coverage * 100).toFixed(1)}%`, null, 'info');
 
   // 7. The build hash: recomputed from the board and from the data the page reads, against the reconciliation line.
   const hashBoard = fnv1a(board.map((r) => r.slug + r.implied_value_usd).join(''));
@@ -1601,16 +1829,18 @@ export function integrityChecks(snapshot: Snapshot, board: BoardRow[], radar: Ra
   return out;
 }
 
-/** The calibration in a few lines: model, peers, out-of-sample errors (5-fold and walk-forward), band coverage and Brier. */
+/** The calibration in a few lines: model, peers, out-of-sample errors (leave-one-out and walk-forward), level, band coverage and Brier. */
 export function calibrationSummary(radar: RadarData): string {
   const f = radar.fit;
   const o = radar.odds;
-  const fitText = f.fallback ? 'fit degenerate, radar-2 constants used' : `${f.fit_method} coefficients [${f.coefficients.join(', ')}] (${f.features.join(', ')})`;
+  const fitText = f.fallback ? 'fit degenerate, terms left at zero' : `${f.fit_method} coefficients [${f.coefficients.join(', ')}] (${f.features.join(', ')}), curve [${f.curve.join(', ')}]`;
+  const x = o.experiment;
   return (
-    `model ${radar.model_version}, ${radar.peer_total} peers, global median x${radar.global_median_multiple}, cap x${radar.peer_cap_multiple}; ${fitText}\n` +
-    `token radar: ${f.cv.folds}-fold OOF median abs log error ${f.cv.fitted} fitted vs ${f.cv.baseline} category-only (${f.cv.n} peers); walk-forward ${f.walk.fitted} fitted vs ${f.walk.baseline} category-only (${f.walk.n_fit} fit / ${f.walk.n} test, ${f.walk.undated} undated counted oldest)\n` +
-    `token radar: band P25/P75 of OOF residual ${f.band.q25}/${f.band.q75}, walk-forward coverage ${(f.band.coverage * 100).toFixed(1)}% (${f.band.inside}/${f.band.n}); propensity Brier ${o.brier_propensity} vs base rate ${o.brier_base} (${o.n_train} fit / ${o.n_test} held, scope ${o.n_scope})\n` +
-    `token radar: 80% band P10/P90 ${f.band80.q10}/${f.band80.q90}, walk-forward coverage ${(f.band80.coverage * 100).toFixed(1)}% (${f.band80.inside}/${f.band80.n})`
+    `model ${radar.model_version}, ${radar.peer_total} peers, global median x${radar.global_median_multiple}, cap x${radar.peer_cap_multiple}, blend k ${f.k} (inner LOO over all peers picks ${f.k_loo}), thin-category cap ln ${f.residual_cap}; ${fitText}\n` +
+    `token radar: leave-one-out median abs log error ${f.loo.fitted} fitted vs ${f.loo.baseline} category-only (${f.loo.n} peers, level ${f.level.loo}); walk-forward ${f.walk.fitted} fitted vs ${f.walk.baseline} category-only (${f.walk.n_fit} fit / ${f.walk.n} test, ${f.walk.undated} undated counted oldest, level ${f.level.walk})\n` +
+    `token radar: band P25/P75 of out-of-fold residual ${f.band.lo}/${f.band.hi}, walk-forward coverage ${(f.band.coverage * 100).toFixed(1)}% (${f.band.inside}/${f.band.n}); propensity Brier ${o.brier_propensity} vs base rate ${o.brier_base} (${o.n_train} fit / ${o.n_test} held, scope ${o.n_scope}, smoothing ${o.smoothing})\n` +
+    `token radar: 80% band P10/P90 ${f.band80.lo}/${f.band80.hi}, walk-forward coverage ${(f.band80.coverage * 100).toFixed(1)}% (${f.band80.inside}/${f.band80.n})\n` +
+    `token radar: odds test, smoothing ${x.variant} vs ${x.current}: held-half Brier ${x.brier_variant} vs ${x.brier_current}, tolerance +${x.tolerance}: ${x.adopted ? 'adopted' : 'rejected, odds as before'}`
   );
 }
 

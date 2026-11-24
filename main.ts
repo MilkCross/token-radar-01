@@ -105,9 +105,13 @@ const top5 = radar.rows.slice(0, 5).map((r) => `#${r.rank} ${r.name} ${usd(r.imp
 const lad = radar.fit.ladder;
 const f3 = (n: number): string => n.toFixed(3);
 const ladderTable = [
-  `  ${'variant'.padEnd(12)}${lad.schemes.map((s) => s.padStart(14)).join('')}   (n ${lad.n.join('/')})`,
-  ...lad.rows.map((r) => `  ${r.id.padEnd(12)}${r.errors.map((e) => f3(e).padStart(14)).join('')}   vs naive ${r.vs_naive.map(f3).join('/')}, vs category-only ${r.vs_category.map(f3).join('/')}`),
+  `  ${'variant'.padEnd(42)}${lad.schemes.map((x) => x.padStart(14)).join('')}   (n ${lad.n.join('/')})`,
+  ...lad.rows.map((r) => `  ${r.label.padEnd(42)}${r.errors.map((e) => f3(e).padStart(14)).join('')}   vs naive ${r.vs_naive.map(f3).join('/')}, level (sum predicted / sum actual) ${r.level.map(f3).join('/')}`),
 ].join('\n');
+const termLines = lad.terms.map((t) => `  ${t[0].padEnd(20)}LOO ${f3(t[1])} (${t[3] >= 0 ? '+' : ''}${f3(t[3])}), walk-forward ${f3(t[2])} (${t[4] >= 0 ? '+' : ''}${f3(t[4])}): ${t[5]}`).join('\n');
+const thinRows = radar.rows.filter((r) => r.thin);
+const cappedRows = radar.rows.filter((r) => r.verdict_capped);
+const x = radar.odds.experiment;
 const promotedLines = radar.rows.filter((r) => r.promoted).map((r) => `  #${r.rank} ${r.name} (${r.category ?? 'Uncategorized'}, TVL ${usd(r.tvl_usd)}, ${r.chains.length} chains): ${usd(r.implied_value_usd)}, range ${usd(r.value_low)} to ${usd(r.value_high)}, ${r.farm_verdict.split(':')[0]}. ${r.why}`).join('\n');
 const quarantineLines = radar.quarantined.map((q) => `  ${q.name} (${q.slug}): ${q.reason}`).join('\n');
 const failed = radar.integrity.filter((c) => c.pass === false);
@@ -116,11 +120,12 @@ process.stdout.write(
   `token radar: ${calibrationSummary(radar)}\n` +
     `token radar: ${coverageSummary(radar)}\n` +
     `token radar: watchlist coverage ${onBoard}/${snapshot.watchlist.length}; verdicts, original rows ${tally(board.filter((r) => !promotedSlugs.has(r.slug)))}; promoted rows ${tally(board.filter((r) => promotedSlugs.has(r.slug)))}; reconciliation ${radar.recon.rows} rows, sum ${usd(radar.recon.sum_implied_usd)}, build ${radar.recon.build}\n` +
-    `token radar: validation ladder, median abs log error (leakage-free refits)\n${ladderTable}\n` +
-    `  leave-one-category-out, ${lad.loco.categories} categories with >= 4 peers (${lad.loco.n} peers): full ${f3(lad.loco.full)}, category-only ${f3(lad.loco.category_only)}, naive ${f3(lad.loco.naive)}\n` +
-    `  ablation under 5-fold, full ${f3(lad.ablation.full)}: ${lad.ablation.terms.map((t) => `without ${t.term} ${f3(t.error)} (${t.delta >= 0 ? '+' : ''}${f3(t.delta)})`).join(', ')}\n` +
-    `  band coverage, walk-forward: 50% band ${(radar.fit.band.coverage * 100).toFixed(1)}% (${radar.fit.band.inside}/${radar.fit.band.n}); 80% band ${(radar.fit.band80.coverage * 100).toFixed(1)}% (${radar.fit.band80.inside}/${radar.fit.band80.n})\n` +
+    `token radar: THIN rule, ${thinRows.length} of ${board.length} rows in categories under 3 peers; the Marginal cap changed ${cappedRows.length} verdicts (Worth it to Marginal)\n` +
+    `token radar: validation ladder, median abs log error (leakage-free refits, k tuned inside every fold)\n${ladderTable}\n` +
+    `  shipped-model terms at fixed k = ${radar.fit.k} (reference LOO ${f3(lad.reference[0]!)}, walk-forward ${f3(lad.reference[1]!)}; change in error, + means removal hurts)\n${termLines}\n` +
+    `  band coverage, walk-forward with bands from the training part alone: 50% band ${(radar.fit.band.coverage * 100).toFixed(1)}% (${radar.fit.band.inside}/${radar.fit.band.n}); 80% band ${(radar.fit.band80.coverage * 100).toFixed(1)}% (${radar.fit.band80.inside}/${radar.fit.band80.n})\n` +
     `  ${lad.note}\n` +
+    `token radar: odds test, smoothing ${x.variant} vs ${x.current}: Brier ${x.brier_variant} vs ${x.brier_current}, tolerance +${x.tolerance}: ${x.adopted ? 'ADOPTED' : 'REJECTED'}\n` +
     `token radar: set-aside audit, ${radar.promoted_size} promoted, ${radar.quarantined.length} quarantined\n${promotedLines}${quarantineLines === '' ? '' : `\n${quarantineLines}`}\n` +
     `token radar: top 5\n  ${top5}\n` +
     `token radar: dashboard source ${dashBytes} bytes, dossier ${Buffer.byteLength(dossier)} bytes with ${shots.length} screenshots\n` +

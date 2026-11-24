@@ -6,46 +6,47 @@
 
 An entry for make.fun's [“Build the best token launch radar”](https://make.fun/bounty/token-radar-01) bounty, built by an AI agent.
 
-## Integrity (computed at build time, shown as chips on the board)
+## Integrity (computed at build time, shown on the board's cover)
 
 | Check | Result | Status |
 |---|---|---|
 | Coverage | 198 ranked (20 promoted) + 416 tokenized + 144 product-excluded + 0 quarantined = 758 of 758; 0 unaccounted | pass |
 | Board invariants | 198 values positive, non-increasing by rank; watchlist 40/40 | pass |
-| No hardcoded names | scanned 420 string literals in lib/model.ts (88885 bytes) for exact matches of 198 board slugs: 0 found; positive control caught a planted slug; name-only coincidence, not a slug: Abstract (a chain name in the cost-tier table) | pass |
-| Farm reconciliation | 198 rows rebuilt (point EV, P25 EV, all-in, break-even, verdict label): 0 mismatches | pass |
-| Validation ladder | median abs log error, full / category-only / naive: 5-fold 1.20/1.51/1.63, 10-fold x3 1.43/1.57/1.62, LOO 1.45/1.58/1.62, walk-forward 1.27/1.57/1.59 | info |
-| Band coverage | walk-forward: 50% band 51.0% (26/51) vs 50% nominal; 80% band 78.4% (40/51) vs 80% nominal | info |
-| Build hash | dc205a80 (board.json dc205a80, data.js dc205a80) | pass |
+| No hardcoded names | scanned the string literals in lib/model.ts for exact matches of the 198 board slugs: 0 found; positive control caught a planted slug | pass |
+| Farm reconciliation | 198 rows rebuilt (point EV, P25 EV, all-in, break-even, THIN cap, verdict label): 0 mismatches | pass |
+| Thin rule | 102 of 198 rows are THIN (category under 3 peers); the cap turned 20 Worth it into Marginal | pass |
+| Blend constant | k = 10 shipped; an inner leave-one-out over all 128 peers picks 10 | pass |
+| Validation ladder | median abs log error, leave-one-out / walk-forward: naive 1.62/1.59, category-only 1.58/1.57, power law alone 1.30/1.14, radar-6 1.45/1.27, radar-7 (shipped) 1.30/1.09 | info |
+| Odds test | smoothing 8 vs 4 on the held half: Brier 0.2242 vs 0.2238 (tolerance +0.005): adopted | info |
+| Band coverage | walk-forward, bands built from the training part alone: 50% band 58.8% (30/51); 80% band 78.4% (40/51) | info |
+| Build hash | df3b09d4 (board.json and data.js agree) | pass |
 | Known limit | 128 peers; bands are wide for thin categories. | limit |
 
-## radar-6 facts
+## radar-7 facts
 
-- **Point estimates frozen.** The 178 radar-5 rows keep identical value, odds, range and farm inputs; only ranks shift where a promoted row inserts above them.
-- **Validation ladder** (median abs log error, multiples, shrinkage and Huber refit inside every training part; the 10-fold column pools 3 repeats):
+- **Ranking is the signal; the level carries wide uncertainty.** Held out, the median miss is about 3.7x (leave-one-out) and 3.0x (walk-forward), and the model predicts only about 21% of the aggregate held-out market cap. Read the values as relative.
+- **Model.** A global power law of market cap on TVL (Huber fit over 128 priced peers), pulled toward each category's mcap/TVL multiple: the category keeps weight w = n/(n+10) of its deviation from the curve, the multiple's cap tightens as the category thins, and a category under 5 peers may not stray from the curve by more than the peers' P90 residual. Size (free), growth, maturity and chain terms are fitted by Huber regression; the product of the last three and the base is clamped to 0.5–2.
+- **Thin rule.** A category with under 3 peers marks its rows THIN (102 of 198) and caps their verdict at Marginal.
+- **Ladder** (median abs log error, every refit inside its training part, k tuned by an inner leave-one-out; the 5-fold and repeated 10-fold columns are dropped):
 
-| Variant | 5-fold | 10-fold x3 | Leave-one-out | Walk-forward |
-|---|---|---|---|---|
-| Naive (global median) | 1.632 | 1.618 | 1.623 | 1.592 |
-| Category-only (shrunk) | 1.508 | 1.569 | 1.582 | 1.565 |
-| Full model (+ Huber) | 1.204 | 1.435 | 1.446 | 1.272 |
+| Variant | Leave-one-out | Walk-forward (age cohort) |
+|---|---|---|
+| Naive (TVL x global median) | 1.623 | 1.592 |
+| Category-only (shrunk) | 1.582 | 1.565 |
+| Power law alone | 1.302 | 1.145 |
+| radar-6 (category + fitted adjustments) | 1.446 | 1.272 |
+| radar-7 (shipped) | 1.296 | 1.094 |
 
-  The full model's edge is 0.80x category-only under 5-fold but 0.91x under leave-one-out, so the 5-fold figure is the flattering one. Leave-one-category-out (full model, 11 categories): 1.183 vs 1.555 category-only and 1.501 naive, but worse than the naive multiple for CEX, Dexs and Lending individually. Ablation under 5-fold (change vs full 1.204): ln TVL +0.323, 7d change +0.004, ln age +0.000, ln chains +0.000; only ln TVL does real work. Not tuned inside the folds: the shrinkage weight 8, the p90 cap level, the thin-category threshold 3, the Huber delta 1.345 and the 60/40 walk-forward split were set during development with the full peer set in view, so every error here is mildly optimistic.
-- **Bands.** 50% band walk-forward coverage 51.0% (26/51); 80% band 78.4% (40/51).
-- **Set-aside audit.** The 20 protocols radar-5 left unranked all have TVL at or above the $50M floor and at least one chain, so all 20 are promoted (low confidence, 80% band, WHY line states the multiple's source) and 0 are quarantined. Circle Gateway (cross-chain bridge), USDCx (stablecoin wrapper) and Figure Markets Exchange look like product types but are not caught by the exclusion rules, so they are priced and flagged.
-- **Farm economics.** Each row shows break-even launch value (all-in x wallets / (5% x odds)), net at P25 and its ROI, and net at $2,500 / $10,000 / $50,000 deposits (only the opportunity term moves). Rank ranges such as #14 [10-20] place the row's displayed range ends in the point-value ordering.
+  Removing a term from the shipped model changes the error by under 0.07 in either scheme and in different directions, so no single term is proved here; a hash-noise control does not help. The walk-forward is an age-cohort split of one snapshot, not a backtest; the margins are within bootstrap noise, and the shipped model was chosen by a prespecified rule, not a decisive measurement.
+- **Bands.** Out-of-fold P25–P75 (P10–P90 for low-confidence rows). Measured walk-forward coverage: 50% band 58.8% (30/51), 80% band 78.4% (40/51).
+- **Launch odds.** A regularized logistic regression of "records a token" (Brier 0.224 vs 0.249 for the base rate). The build tests a larger smoothing constant on the category-share feature on the same held half and keeps it only if Brier stays within +0.005: 8 vs 4 scored 0.2242 vs 0.2238, so it is used.
+- **Farm.** Every row has a plan, an itemised all-in cost, break-even launch value and net at P25 EV per hands-on hour. The board's scenario inputs (capital, weeks) rescale net $/h with rewards proportional to capital x weeks held against the plan's own; printed verdicts, ranks and screenshots stay at baseline. Verdict rule: **Worth it** needs point EV >= 3x all-in and P25 EV >= 1x all-in (never for a THIN row); **Marginal** is point EV >= 1x; **Skip** is below. Not tuned to a count.
 
 ## What it does
 
-Reads a sealed DefiLlama snapshot (758 protocols, as of 2026-11-14) and ranks 198 pre-token protocols by implied token value (178 as in radar-5 plus 20 promoted low-confidence rows). The model (radar-6) is calibrated from the snapshot itself; no protocol names are hardcoded.
+Reads a sealed DefiLlama snapshot (758 protocols, as of 2026-11-14) and ranks 198 pre-token protocols by implied token value (178 plus 20 promoted low-confidence rows), Σ $2.37B. Values are implied circulating market cap from peers' circulating mcap/TVL, not FDV: the snapshot has no supply or unlock schedules. No protocol names are hardcoded.
 
-- **Valuation.** Values are implied circulating market cap, from peers' circulating mcap/TVL. They are not FDV: the snapshot has no supply or unlock schedules. Each protocol is priced at TVL × its category's peer mcap/TVL multiple (peers are same-category protocols that already have a token; multiples are shrunk toward the global median and capped at the peer 90th percentile). Size, growth, maturity and chain adjustments are fitted by Huber regression on 128 tokenized peers, not hand-set.
-- **Out-of-sample validation.** Median absolute log error, fitted vs category-multiple only: 5-fold cross-validation 1.20 vs 1.51; walk-forward by listed date 1.27 vs 1.57.
-- **Value ranges.** Each row carries a P25–P75 range built from out-of-fold residuals. Measured walk-forward coverage of that range is 51%.
-- **Launch odds.** A regularized logistic regression gives a launch propensity from the peers' record (Brier 0.224 vs 0.249 for the base rate). It is a propensity, not a prediction that a protocol will issue a token.
-- **Farm plans.** Every row has a step-by-step plan that names the protocol's actual chains and costs them from a stated chain-tier table (an assumption of the model, not a measurement). Wallet dilution and deposits scale with TVL.
-- **Verdict rule.** All-in cost = fees + hands-on hours × $15 + a capital opportunity term, deposit × 4.5% APR × hold weeks / 52 (the hold is the plan's own, 21 to 60 days; 8 weeks would apply only to a plan with none). P25 expected value per wallet = P25 value × launch odds × 5% pool / wallets. **Worth it** needs point EV ≥ 3× all-in cost and P25 EV ≥ 1× all-in cost; **Marginal** is point EV ≥ 1× all-in cost but not Worth it; **Skip** is point EV < 1×. The thresholds are not tuned to a target count.
-- **Dashboard.** A dark, sortable board with a verdict filter, laid out master-detail: the table on the left, a sticky detail pane on the right (facts, valuation waterfall, nearest tokenized peers, farm plan and itemised verdict). Thin categories show cross-category peers, tagged as context only: they did not enter the value. The Model tab shows a calibration scatter and the basis note. A reconciliation strip shows the row count, the sum of implied values and a build hash. Comparables and live-token views are also included.
+- **Dashboard.** A dark, sortable board: a cover (ablation ladder, 758 accounting bar, measured calibration, self-critique, one-line integrity strip), a verdict filter, odds bars, range whiskers, a net $/h column and the scenario inputs, laid out master-detail with a sticky pane (factor decomposition with held-out stats, nearest priced peers, drop-share x deposit matrix, itemised farm verdict and plan). The Model tab is the audit view; Comparables and Live tokens complete it.
 
 ## Run
 
@@ -54,11 +55,13 @@ Requires Node.js 22+. The program is `main.ts` (standard library only, no networ
 - Input: the snapshot at `/input/snapshot.json`
 - Run: `node main.ts`
 - Output (in `/output`): `board.json`, `data.js`, the `dashboard/` app, `screenshots/`, and `dossier.json`
+- Check: `node verify.ts --input <snapshot.json>` runs the program twice and checks byte-identical outputs, the size caps, no web addresses, no hardcoded names and the vendor file.
 
 ## Layout
 
 - `main.ts` — entrypoint
-- `lib/model.ts` — valuation model, validation, launch odds, farm-plan generation and verdicts
+- `lib/model.ts` — valuation model, validation, launch odds, farm plans and verdicts
+- `verify.ts` — build-time verification
 - `dashboard/` — the radar dashboard (index.html, app.css, app.js)
 - `screenshots/` — dashboard screenshots
 - `vendor/makefun-board.ts` — board/dossier builder (upstream, unmodified)
